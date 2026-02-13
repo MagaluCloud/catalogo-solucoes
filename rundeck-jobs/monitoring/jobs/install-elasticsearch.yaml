@@ -1,0 +1,48 @@
+- defaultTab: nodes
+  description: ''
+  executionEnabled: true
+  id: 8e0c9550-e357-47f1-b0a5-a04ccf43334f
+  loglevel: INFO
+  name: Install Elasticsearch
+  nodeFilterEditable: false
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |-
+        #!/bin/bash
+        set -e
+
+        echo "🔧 Instalando dependências..."
+        sudo apt update
+        sudo apt install -y apt-transport-https curl gnupg
+
+        echo "🔑 Importando chave GPG do Elasticsearch..."
+        curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo gpg --dearmor -o /usr/share/keyrings/elastic-keyring.gpg
+
+        echo "📦 Adicionando repositório..."
+        echo "deb [signed-by=/usr/share/keyrings/elastic-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main" | \
+          sudo tee /etc/apt/sources.list.d/elastic-8.x.list
+
+        echo "🔁 Atualizando pacotes..."
+        sudo apt update
+
+        echo "⬇️ Instalando Elasticsearch..."
+        sudo apt install -y elasticsearch
+
+        echo "✅ Ativando e iniciando serviço..."
+        sudo systemctl daemon-reexec
+        sudo systemctl enable elasticsearch
+        sudo systemctl start elasticsearch
+
+        echo "⏳ Aguardando Elasticsearch iniciar..."
+        sleep 10
+
+        echo "🔍 Verificando status:"
+        curl -s http://localhost:9200 | jq
+    keepgoing: false
+    strategy: node-first
+  uuid: 8e0c9550-e357-47f1-b0a5-a04ccf43334f

@@ -1,0 +1,60 @@
+- defaultTab: nodes
+  description: ''
+  executionEnabled: true
+  id: 998ee6cd-aaaf-4533-acad-3bc20ace78a9
+  loglevel: INFO
+  name: 'Teste de performance com k6 - name  '
+  nodeFilterEditable: false
+  options:
+  - label: api-key
+    name: APIKEY
+    required: true
+  - name: target_url
+    required: true
+  - name: duration
+    required: true
+  - name: tenant_id
+  - name: vus
+    required: true
+  - label: 'Nome do Cluster '
+    name: CLUSTER_NAME
+  - enforced: true
+    label: Region
+    name: region
+    required: true
+    values:
+    - br-ne1
+    - br-se1
+    valuesListDelimiter: ','
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |-
+        # Opcional: nome do cluster (se fornecido pelo usuário)
+        CLUSTER_NAME="${RD_OPTION_CLUSTER_NAME}"
+
+        echo "🔎 Buscando cluster Kubernetes..."
+
+        if [[ -n "$CLUSTER_NAME" ]]; then
+          echo "➡️  Usando cluster informado: $RD_OPTION_CLUSTER_NAME"
+          CLUSTER_ID=$(mgc kubernetes cluster list --region br-se1 --api-key="$API_KEY" --output json \
+            | sed 's/\x1B\[[0-9;]*[mK]//g' \
+            | jq -r --arg name "$CLUSTER_NAME" '.results[] | select(.name == $name) | .id')
+
+          if [[ -z "$CLUSTER_ID" ]]; then
+            echo "❌ Cluster com nome '$CLUSTER_NAME' não encontrado."
+            exit 1
+          fi
+        else
+          echo "➡️  Nenhum cluster especificado, usando o primeiro disponível."
+          CLUSTER_ID=$(mgc kubernetes cluster list --region br-se1 --api-key="$API_KEY" --output json \
+            | sed 's/\x1B\[[0-9;]*[mK]//g' \
+            | jq -r '.results[0].id')
+        fi
+    keepgoing: false
+    strategy: node-first
+  uuid: 998ee6cd-aaaf-4533-acad-3bc20ace78a9

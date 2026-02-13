@@ -1,0 +1,125 @@
+- defaultTab: nodes
+  description: ''
+  executionEnabled: true
+  id: 116755da-4f50-433c-9fc0-90908480e4a8
+  loglevel: INFO
+  name: 'Teste de performance com k6 - internal '
+  nodeFilterEditable: false
+  options:
+  - label: api-key
+    name: APIKEY
+    required: true
+  - name: target_url
+    required: true
+  - name: duration
+    required: true
+  - name: tenant_id
+  - name: vus
+    required: true
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |-
+        #!/bin/bash
+        set -euo pipefail
+
+        # === Entrada de parâmetros do Rundeck ===
+        TENANT_ID="${RD_OPTION_TENANT_ID}"
+        TARGET_URL="${RD_OPTION_TARGET_URL}"
+        VUS="${RD_OPTION_VUS}"
+        DURATION="${RD_OPTION_DURATION}"
+        API_KEY="${RD_OPTION_APIKEY}"
+
+        echo "🔐 Autenticando no tenant: $TENANT_ID"
+        # mgc auth tenant --api-key "$API_KEY"
+
+        echo "🔎 Buscando cluster Kubernetes..."
+        CLUSTER_ID=$(mgc kubernetes cluster list --region br-se1 --api-key="$API_KEY" --output json \
+          | sed 's/\x1B\[[0-9;]*[mK]//g' \
+          | jq -r '.results[0].id')
+
+        echo "📦 Exportando kubeconfig..."
+        KUBECONFIG_PATH="/tmp/kubeconfig-${API_KEY}"
+        mgc kubernetes cluster kubeconfig "$CLUSTER_ID" --api-key="$API_KEY" \
+          | sed 's/\x1B\[[0-9;]*[mK]//g' > "$KUBECONFIG_PATH"
+        export KUBECONFIG="$KUBECONFIG_PATH"
+
+        JOB_NAME="k6-test-$(date +%s)"
+        CM_NAME="k6-script-${JOB_NAME}"
+
+        echo "📋 Gerando ConfigMap e Job YAML..."
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: $CM_NAME
+        data:
+          test.js: |
+            import http from 'k6/http';
+            import { check } from 'k6';
+
+            export let options = {
+              vus: Number(__ENV.vus),
+              duration: __ENV.duration,
+            };
+
+            export default function () {
+              const res = http.get(__ENV.target_url);
+              check(res, {
+                'status 200': (r) => r.status === 200,
+              });
+            }
+        ---
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: $JOB_NAME
+        spec:
+          ttlSecondsAfterFinished: 60
+          template:
+            spec:
+              restartPolicy: Never
+              containers:
+              - name: k6
+                image: grafana/k6
+                command: ["k6", "run", "/test/test.js"]
+                env:
+                - name: vus
+                  value: "$VUS"
+                - name: duration
+                  value: "$DURATION"
+                - name: target_url
+                  value: "$TARGET_URL"
+                volumeMounts:
+                - name: script
+                  mountPath: /test
+              volumes:
+              - name: script
+                configMap:
+                  name: $CM_NAME
+        EOF
+
+        echo "⏳ Aguardando término do Job no cluster..."
+        if ! kubectl wait --for=condition=complete job/$JOB_NAME --timeout=90s; then
+          echo "❌ Job falhou ou excedeu tempo limite."
+          exit 1
+        fi
+
+        echo ""
+        echo "📄 Últimas linhas do log do Job:"
+        echo "------------------------------------------"
+        kubectl logs job/$JOB_NAME | tail -n 30
+        echo "------------------------------------------"
+
+        echo "🧹 Limpando ConfigMap temporário..."
+        kubectl delete configmap "$CM_NAME" || echo "⚠️ Falha ao remover ConfigMap $CM_NAME"
+
+        echo "✅ Teste finalizado com sucesso no tenant $TENANT_ID"
+    keepgoing: false
+    strategy: node-first
+  timeout: 120m
+  uuid: 116755da-4f50-433c-9fc0-90908480e4a8

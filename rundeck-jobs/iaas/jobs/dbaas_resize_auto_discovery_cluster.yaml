@@ -1,0 +1,674 @@
+# ==============================================================================
+# Script: dbaas_resize_auto_discovery_cluster
+# Autor: Wilson Lucena 
+# Data: 2026-02-04
+# Descrição: Varre os bancos de dados na MGC verifica o tamanho do disco e o uso 
+#            avisa em um canal do Gchat e conforme parâmetros pode sugerir um 
+#.           recize ou disparar um outro job que faz o recize automatico. 
+# ==============================================================================
+
+
+- id: dbaas_resize_auto_discovery_cluster
+  defaultTab: output
+  description: "Auto discovery DBaaS Cluster  (API + métricas) com alerta no GChat e resize automático opcional."
+  executionEnabled: true
+  loglevel: INFO
+  name: "MGC - DBaaS Cluster - AutoDiscovery + GChat + AutoResize"
+  nodeFilterEditable: false
+  scheduleEnabled: false
+
+  options:
+    # ============================================================
+    # Credenciais MGC
+    # ============================================================
+    - name: API_KEY
+      label: MGC API Key
+      description: "API Key do tenant (secure)."
+      required: true
+      secure: true
+      valueExposed: true
+
+    - name: TENANT_ID
+      label: Tenant ID
+      description: "UUID do tenant (x-tenant-id). Ex: c2881b71-..."
+      required: true
+      value: ""
+
+    # ============================================================
+    # Parâmetros gerais
+    # ============================================================
+    - name: REGION
+      label: Região (opcional)
+      description: "Ex: br-se1. Se vazio, auto-detect tenta descobrir."
+      required: false
+      value: ""
+
+    - name: MOUNTPOINT
+      label: Mountpoint preferido
+      description: "Se vazio ou '/', auto-detect escolhe disco de dados."
+      required: false
+      value: "/"
+
+    - name: TIMEOUT
+      label: Timeout curl (segundos)
+      required: false
+      value: "4"
+
+    - name: OUTPUT_DIR
+      label: Diretório de saída
+      required: false
+      value: "/var/log/rundeck"
+
+    - name: SHOW_SAMPLE
+      label: Debug (0/1)
+      description: "1 mostra logs extras (ajuda troubleshooting)."
+      required: false
+      value: "0"
+
+    # ============================================================
+    # Política de decisão
+    # ============================================================
+    - name: THRESHOLD_WARN
+      label: Threshold WARN (%)
+      required: false
+      value: "80"
+
+    - name: THRESHOLD_CRIT
+      label: Threshold CRIT (%)
+      required: false
+      value: "90"
+
+    - name: PCT_INCREASE_WARN
+      label: Resize WARN (%)
+      required: false
+      value: "30"
+
+    - name: PCT_INCREASE_CRIT
+      label: Resize CRIT (%)
+      required: false
+      value: "50"
+
+    - name: AUTO_APPLY
+      label: Auto aplicar resize (0/1)
+      description: "0 = só alerta. 1 = dispara job de resize quando WARN/CRIT."
+      required: false
+      value: "0"
+
+    - name: COOLDOWN_MINUTES
+      label: Cooldown (min)
+      description: "Evita disparar resize repetido em looping para a mesma instância."
+      required: false
+      value: "360"
+
+    # ============================================================
+    # Integração com job de resize do Rundeck
+    # ============================================================
+    - name: RESIZE_JOB_UUID
+      label: UUID do job de resize
+      required: true
+      value: "afef53f9-243b-43be-8364-fddcb0b73a6a"
+
+    - name: RD_URL
+      label: URL do Rundeck
+      required: false
+      value: "http://localhost:4440"
+
+    - name: RD_API_VERSION
+      label: Versão API Rundeck
+      required: false
+      value: "52"
+
+    - name: RD_WEBHOOK_URL
+      label: Url webhook Chat Comunication
+      required: true
+      value: "<<SUA-API-KEY>>"
+
+  sequence:
+    keepgoing: false
+    strategy: node-first
+    commands:
+      - description: "Auto discovery cluster + alerta no GChat + resize opcional"
+        script: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # ============================================================
+          # 0) SEGREDOS (Key Storage)
+          #
+          # IMPORTANTE:
+          # - NÃO use ${key:...} sem aspas, senão o Bash tenta expandir "key"
+          #   e com set -u dá: "key: unbound variable"
+          #
+          # Coloque como string literal (aspas simples) e o Rundeck faz
+          # a interpolação antes do script executar.
+          #
+          # (Manutenção futura)
+          # - Webhook GChat fica em:
+          #     keys/project/iaas/gchat/webhook_url
+          # - Token API Rundeck fica em:
+          #     keys/project/iaas/rundeck/api_token
+          #
+          # - Link do canal (referência):
+          #   
+          # ============================================================
+          # Sugestão (se preferir Key Storage):
+          # GCHAT_WEBHOOK_URL='${key:keys/project/iaas/gchat/webhook_url}'
+
+          GCHAT_WEBHOOK_URL="${RD_OPTION_RD_WEBHOOK_URL:-}"
+          RD_TOKEN='${key:keys/project/iaas/rundeck/api_token}'
+
+          # Se por algum motivo o Rundeck NÃO interpolar, fica literal '${key:...}'.
+          if [[ "${GCHAT_WEBHOOK_URL}" == "\${key:"* ]]; then GCHAT_WEBHOOK_URL=""; fi
+          if [[ "${RD_TOKEN}" == "\${key:"* ]]; then RD_TOKEN=""; fi
+
+          if [[ -n "${GCHAT_WEBHOOK_URL}" ]]; then
+            echo "GCHAT: webhook carregado do Key Storage/Option (len=${#GCHAT_WEBHOOK_URL})"
+          else
+            echo "GCHAT: webhook vazio (mensagens não serão enviadas)"
+          fi
+
+          # ============================================================
+          # 1) Inputs (Rundeck exporta options em RD_OPTION_*)
+          # ============================================================
+          API_KEY="${RD_OPTION_API_KEY:-}"
+          TENANT_ID="${RD_OPTION_TENANT_ID:-}"
+          REGION="${RD_OPTION_REGION:-}"
+          MOUNTPOINT="${RD_OPTION_MOUNTPOINT:-/}"
+          TIMEOUT="${RD_OPTION_TIMEOUT:-4}"
+          OUTPUT_DIR="${RD_OPTION_OUTPUT_DIR:-/var/log/rundeck}"
+          SHOW_SAMPLE="${RD_OPTION_SHOW_SAMPLE:-0}"
+
+          THRESHOLD_WARN="${RD_OPTION_THRESHOLD_WARN:-80}"
+          THRESHOLD_CRIT="${RD_OPTION_THRESHOLD_CRIT:-90}"
+          PCT_INCREASE_WARN="${RD_OPTION_PCT_INCREASE_WARN:-30}"
+          PCT_INCREASE_CRIT="${RD_OPTION_PCT_INCREASE_CRIT:-50}"
+          AUTO_APPLY="${RD_OPTION_AUTO_APPLY:-0}"
+          COOLDOWN_MINUTES="${RD_OPTION_COOLDOWN_MINUTES:-360}"
+
+          RESIZE_JOB_UUID="${RD_OPTION_RESIZE_JOB_UUID:-}"
+          RD_URL="${RD_OPTION_RD_URL:-http://localhost:4440}"
+          RD_API_VERSION="${RD_OPTION_RD_API_VERSION:-52}"
+
+          CHECK_TS_ISO="$(date -Iseconds)"
+          CHECK_TS_HUMAN="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+          # ============================================================
+          # 2) Validações básicas
+          # ============================================================
+          if [[ -z "${API_KEY}" ]]; then
+            echo "ERRO: API_KEY não informada."
+            exit 1
+          fi
+          if [[ -z "${TENANT_ID}" ]]; then
+            echo "ERRO: TENANT_ID não informado."
+            exit 1
+          fi
+          if [[ -z "${RESIZE_JOB_UUID}" ]]; then
+            echo "ERRO: RESIZE_JOB_UUID não informado."
+            exit 1
+          fi
+
+          echo "OK: TENANT_ID=${TENANT_ID}"
+          echo "OK: API_KEY recebida (tamanho=${#API_KEY})"
+
+          # ============================================================
+          # 3) Dependências
+          # ============================================================
+          command -v mgc  >/dev/null 2>&1 || { echo "ERRO: mgc não encontrado no PATH"; exit 1; }
+          command -v jq   >/dev/null 2>&1 || { echo "ERRO: jq não encontrado no PATH"; exit 1; }
+          command -v curl >/dev/null 2>&1 || { echo "ERRO: curl não encontrado no PATH"; exit 1; }
+          command -v awk  >/dev/null 2>&1 || { echo "ERRO: awk não encontrado no PATH"; exit 1; }
+          command -v sed  >/dev/null 2>&1 || { echo "ERRO: sed não encontrado no PATH"; exit 1; }
+
+          strip_ansi() { sed -r 's/\x1B\[[0-9;]*[mK]//g'; }
+
+          # Sanitiza espaços/linhas: remove \r, \n, tabs, e colapsa múltiplos espaços
+          clean_mp() {
+            local s="${1:-}"
+            s="${s//$'\r'/}"
+            s="${s//$'\n'/}"
+            s="${s//$'\t'/ }"
+            # trim + colapsa espaços
+            s="$(echo "$s" | awk '{$1=$1;print}')"
+            echo "$s"
+          }
+
+          if [[ "${SHOW_SAMPLE}" == "1" ]]; then
+            echo "DEBUG: mgc --version: $(mgc --version || true)"
+            echo "DEBUG: RD_URL=${RD_URL} RD_API_VERSION=${RD_API_VERSION}"
+          fi
+
+          # ============================================================
+          # 4) Helpers de API
+          # ============================================================
+          api_get() {
+            local url="$1"
+            curl -sS \
+              -H "x-api-key: ${API_KEY}" \
+              -H "x-tenant-id: ${TENANT_ID}" \
+              "$url"
+          }
+
+          # ============================================================
+          # 5) Mensageria GChat
+          # ============================================================
+          gchat_send() {
+            local msg="$1"
+
+            # Sempre mostra no log o que vai para o GChat
+            echo "GCHAT >> ${msg}"
+
+            if [[ -z "${GCHAT_WEBHOOK_URL}" ]]; then
+              echo "GCHAT !! Webhook não configurado (mensagem não enviada)"
+              return 0
+            fi
+
+            local resp
+            resp="$(curl -sS -X POST \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg text "$msg" '{text:$text}')" \
+              "${GCHAT_WEBHOOK_URL}" || true)"
+
+            if [[ -n "${resp}" ]]; then
+              echo "GCHAT << resposta: ${resp}"
+            else
+              echo "GCHAT << sem resposta (verifique webhook/rede)"
+            fi
+          }
+
+          # ============================================================
+          # 6) Disparo do resize via API do Rundeck (opcional)
+          # ============================================================
+          rundeck_run_resize_job() {
+            local cluster_id="$1"
+            local cluster_name="$2"
+            local percent="$3"
+
+            [[ -n "${RD_TOKEN}" ]] || return 1
+
+            local url="${RD_URL}/api/${RD_API_VERSION}/job/${RESIZE_JOB_UUID}/run"
+
+            # Ajuste estes names se o seu job de resize usar outros nomes de option.
+            local payload
+            payload="$(jq -n \
+              --arg api_key "${API_KEY}" \
+              --arg region "${REGION}" \
+              --arg cluster_id "${cluster_id}" \
+              --arg cluster_name "${cluster_name}" \
+              --arg pct "${percent}" \
+              '{
+                options: {
+                  API_KEY: $api_key,
+                  REGION: $region,
+                  CLUSTER_ID: $cluster_id,
+                  CLUSTER_NAME: $cluster_name,
+                  PERCENTUAL: $pct
+                }
+              }'
+            )"
+
+            curl -sS \
+              -H "X-Rundeck-Auth-Token: ${RD_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "${payload}" \
+              "${url}"
+          }
+
+          # ============================================================
+          # 7) Detectar região (se vazio)
+          # ============================================================
+          detect_region() {
+            local regions=(br-se1 br-ne1 br-ne-1)
+            local r url code
+            for r in "${regions[@]}"; do
+              url="https://api.magalu.cloud/${r}/database/v2/clusters"
+              code="$(curl -sS -o /dev/null -w "%{http_code}" \
+                -H "x-api-key: ${API_KEY}" \
+                -H "x-tenant-id: ${TENANT_ID}" \
+                "$url" || true)"
+              [[ "$code" == "200" ]] && { echo "$r"; return 0; }
+            done
+            return 1
+          }
+
+          if [[ -z "${REGION}" ]]; then
+            REGION="$(detect_region || true)"
+            [[ -n "${REGION}" ]] || { echo "ERRO: não consegui detectar REGION automaticamente."; exit 1; }
+          fi
+
+          echo "OK: REGION=${REGION}"
+          echo "OK: MOUNTPOINT(preferido)=${MOUNTPOINT}"
+          echo "OK: TIMEOUT=${TIMEOUT}s"
+          echo
+
+          # ============================================================
+          # 8) Mapear engine_id -> tipo (mysql|postgres)
+          # ============================================================
+          ENGINES_JSON="$(
+            mgc dbaas engines list --status=ACTIVE --api-key "${API_KEY}" -o json --raw 2>/dev/null \
+            | strip_ansi
+          )"
+
+          declare -A ENGINE_KIND ENGINE_NAME
+          while IFS=$'\t' read -r id name; do
+            lname="$(echo "$name" | tr '[:upper:]' '[:lower:]')"
+            ENGINE_NAME["$id"]="$name"
+            if [[ "$lname" == *mysql* ]]; then
+              ENGINE_KIND["$id"]="mysql"
+            elif [[ "$lname" == *postgres* ]]; then
+              ENGINE_KIND["$id"]="postgres"
+            else
+              ENGINE_KIND["$id"]="unknown"
+            fi
+          done < <(jq -r '.results[] | "\(.id)\t\(.name)"' <<< "$ENGINES_JSON")
+
+          # ============================================================
+          # 9) Listar instâncias DBaaS via API
+          # ============================================================
+          LIST_URL="https://api.magalu.cloud/${REGION}/database/v2/clusters"
+          LIST_JSON="$(api_get "${LIST_URL}")"
+
+          echo "DBaaS:"
+          jq -r '.results[] | " - \(.name)\t\(.id)\t\(.volume.size)GiB\t\(.status)"' <<< "$LIST_JSON"
+          echo
+
+          # ============================================================
+          # 10) Preparar relatório + cooldown state
+          # ============================================================
+          TS="$(date +%Y%m%d-%H%M%S)"
+          mkdir -p "${OUTPUT_DIR}"
+          OUT_JSON="${OUTPUT_DIR}/dbaas-metrics-${TS}.json"
+          OUT_NDJSON="${OUT_JSON}.ndjson"
+          : > "${OUT_NDJSON}"
+
+          COOLDOWN_DIR="/var/lib/rundeck/var/dbaas-resize-cooldown"
+          mkdir -p "${COOLDOWN_DIR}"
+
+          now_epoch="$(date +%s)"
+          cooldown_sec=$(( COOLDOWN_MINUTES * 60 ))
+
+          # ============================================================
+          # 11) Loop por Cluster
+          # ============================================================
+          while IFS= read -r inst; do
+            CLUSTER_ID="$(jq -r '.id' <<< "$inst")"
+            D="$(api_get "https://api.magalu.cloud/${REGION}/database/v2/clusters/${CLUSTER_ID}")"
+
+            NAME="$(jq -r '.name' <<< "$D")"
+            STATUS="$(jq -r '.status' <<< "$D")"
+            SIZE_GIB_PROV="$(jq -r '.volume.size' <<< "$D")"
+            ENGINE_ID="$(jq -r '.engine_id // empty' <<< "$D")"
+            KIND="${ENGINE_KIND[$ENGINE_ID]:-unknown}"
+            ENAME="${ENGINE_NAME[$ENGINE_ID]:-unknown}"
+            DB_IP="$(jq -r '([.addresses[]? | select(.access=="PRIVATE" and .type=="IPv4") | .address] | .[0]) // empty' <<< "$D")"
+
+            NODE_OK=false
+            APP_OK=false
+            NODE_URL=""
+            APP_URL=""
+
+            DISK_USED_GIB=""
+            DISK_FREE_GIB=""
+            DISK_TOTAL_GIB=""
+            DISK_USED_PCT=""
+            EFFECTIVE_MP="${MOUNTPOINT}"
+
+            if [[ -n "${DB_IP}" ]]; then
+              NODE_URL="http://${DB_IP}:8080/node/metrics"
+
+              if curl -sS --max-time "${TIMEOUT}" "${NODE_URL}" >/dev/null 2>&1; then
+                NODE_OK=true
+                METRICS="$(curl -sS --max-time "${TIMEOUT}" "${NODE_URL}")"
+
+                # ------------------------------------------------------------
+                # Coleta de disco (baseada no seu collector que funciona)
+                # - prioridade: /mnt/database-data
+                # - fallback: maior filesystem ignorando mounts de sistema
+                # ------------------------------------------------------------
+                if [[ -z "${MOUNTPOINT}" || "${MOUNTPOINT}" == "/" ]]; then
+                  AUTO_MP="$(awk '
+                    $0 ~ /^node_filesystem_size_bytes\{/ && $0 !~ /fstype="tmpfs"/ {
+                      if (match($0, /mountpoint="[^"]+"/)) {
+                        mp = substr($0, RSTART+12, RLENGTH-13)
+                        if (mp ~ /^\/run/ || mp=="/boot" || mp=="/boot/efi" || mp=="/proc" || mp=="/sys") next
+                        size = $NF
+                        if (mp == "/mnt/database-data") preferred = mp
+                        if (size > best) { best = size; bestmp = mp }
+                      }
+                    }
+                    END {
+                      if (preferred != "") print preferred;
+                      else if (bestmp != "") print bestmp;
+                    }
+                  ' <<< "$METRICS")"
+                  EFFECTIVE_MP="${AUTO_MP:-/}"
+                fi
+
+                # Sanitiza mountpoint (remove \n/\r e espaços extras)
+                EFFECTIVE_MP="$(clean_mp "${EFFECTIVE_MP}")"
+
+                # Coleta size/avail (awk entende notação científica)
+                SIZE_B="$(awk -v mp="${EFFECTIVE_MP}" '
+                  $0 ~ /^node_filesystem_size_bytes\{/ &&
+                  $0 ~ "mountpoint=\""mp"\"" &&
+                  $0 !~ /fstype="tmpfs"/ { val=$NF }
+                  END { if (val!="") print val }
+                ' <<< "$METRICS")"
+
+                AVAIL_B="$(awk -v mp="${EFFECTIVE_MP}" '
+                  $0 ~ /^node_filesystem_avail_bytes\{/ &&
+                  $0 ~ "mountpoint=\""mp"\"" &&
+                  $0 !~ /fstype="tmpfs"/ { val=$NF }
+                  END { if (val!="") print val }
+                ' <<< "$METRICS")"
+
+                # Calcula tudo em AWK (evita bash com e+10)
+                if [[ -n "${SIZE_B}" && -n "${AVAIL_B}" ]]; then
+                  read -r DISK_USED_GIB DISK_FREE_GIB DISK_TOTAL_GIB DISK_USED_PCT < <(
+                    awk -v size="${SIZE_B}" -v avail="${AVAIL_B}" '
+                      BEGIN {
+                        s = size + 0
+                        a = avail + 0
+                        if (s <= 0) exit 0
+                        u = s - a
+                        gib = 1024*1024*1024
+                        printf "%.2f %.2f %.2f %.2f\n", (u/gib), (a/gib), (s/gib), ((u/s)*100)
+                      }
+                    '
+                  )
+                fi
+
+                if [[ "${SHOW_SAMPLE}" == "1" ]]; then
+                  echo "DEBUG: ${NAME} mp=${EFFECTIVE_MP} size_b=${SIZE_B:-NA} avail_b=${AVAIL_B:-NA} used_pct=${DISK_USED_PCT:-NA}"
+                fi
+              fi
+
+              # Endpoint por engine
+              case "$KIND" in
+                mysql)    APP_URL="http://${DB_IP}:8080/mysql/metrics" ;;
+                postgres) APP_URL="http://${DB_IP}:8080/postgres/metrics" ;;
+                *)        APP_URL="" ;;
+              esac
+
+              if [[ -n "${APP_URL}" ]] && curl -sS --max-time "${TIMEOUT}" "${APP_URL}" >/dev/null 2>&1; then
+                APP_OK=true
+              fi
+            fi
+
+            # Log resumido
+            echo "== ${NAME} | ${KIND} =="
+            echo "id=${CLUSTER_ID} status=${STATUS} prov=${SIZE_GIB_PROV}GiB ip=${DB_IP:-N/A}"
+            if [[ "${NODE_OK}" == "true" && -n "${DISK_USED_PCT}" ]]; then
+              echo "disk(${EFFECTIVE_MP}) used=${DISK_USED_GIB}GiB free=${DISK_FREE_GIB}GiB total=${DISK_TOTAL_GIB}GiB used%=${DISK_USED_PCT}%"
+            else
+              echo "disk(${EFFECTIVE_MP}) N/A"
+            fi
+            echo "node_metrics=${NODE_OK} app_metrics=${APP_OK}"
+            echo
+
+            if [[ "${SHOW_SAMPLE}" == "1" ]]; then
+              echo "DEBUG: DISK_USED_PCT='${DISK_USED_PCT}' USED_GIB='${DISK_USED_GIB}' TOTAL_GIB='${DISK_TOTAL_GIB}' MP='${EFFECTIVE_MP}' NODE_OK='${NODE_OK}'"
+            fi
+
+            # ============================================================
+            # 12) Decisão (OK/WARN/CRIT) + ação
+            # ============================================================
+            LEVEL="OK"
+            PCT_TO_APPLY=""
+
+            if [[ -n "${DISK_USED_PCT}" ]]; then
+              if awk -v v="${DISK_USED_PCT}" -v t="${THRESHOLD_CRIT}" 'BEGIN{ exit !(v+0 >= t+0) }'; then
+                LEVEL="CRIT"
+                PCT_TO_APPLY="${PCT_INCREASE_CRIT}"
+              elif awk -v v="${DISK_USED_PCT}" -v t="${THRESHOLD_WARN}" 'BEGIN{ exit !(v+0 >= t+0) }'; then
+                LEVEL="WARN"
+                PCT_TO_APPLY="${PCT_INCREASE_WARN}"
+              fi
+            fi
+
+            # ============================================================
+            # 12.1) Mensagem OK 
+            # ============================================================
+            if [[ "${LEVEL}" == "OK" ]]; then
+              DETAIL_LINE=""
+              if [[ -n "${DISK_USED_PCT}" ]]; then
+                DETAIL_LINE="💾 Uso => ${DISK_USED_PCT}% (${DISK_USED_GIB}GiB/${DISK_TOTAL_GIB}GiB) | mountpoint '${EFFECTIVE_MP}'"
+              else
+                if [[ "${NODE_OK}" != "true" ]]; then
+                  DETAIL_LINE="🌐 node/metrics inacessível (não foi possível calcular uso)."
+                else
+                  DETAIL_LINE="🔎 mountpoint '${EFFECTIVE_MP}' não encontrado no node/metrics (size/avail)."
+                fi
+              fi
+
+              MSG="$(printf "%s\n" \
+                "✅ [OK] DBaaS - Cluster" \
+                "🎲🎲 Cluster => '${NAME}' | (${KIND})" \
+                "🪪 id=${CLUSTER_ID}" \
+                "${DETAIL_LINE}" \
+                "⌚️Última checagem: ${CHECK_TS_HUMAN}." \
+                "🚀 Nenhuma ação necessária."
+              )"
+
+              gchat_send "${MSG}"
+
+            else
+              # WARN/CRIT -> alerta + opcionalmente dispara resize
+              ALERT_MSG="$(printf "%s\n" \
+                "🚨 [${LEVEL}] DBaaS Cluster" \
+                "🎲🎲 Cluster => '${NAME}' | (${KIND})" \
+                "🪪 id=${cluster_ID} | region=${REGION}" \
+                "💾 Uso => ${DISK_USED_PCT}% (${DISK_USED_GIB}GiB/${DISK_TOTAL_GIB}GiB) | mountpoint '${EFFECTIVE_MP}'" \
+                "⌚️Última checagem: ${CHECK_TS_HUMAN}." \
+                "📈 Sugestão: +${PCT_TO_APPLY}%."
+              )"
+              gchat_send "${ALERT_MSG}"
+
+              if [[ "${AUTO_APPLY}" == "1" ]]; then
+                stamp="${COOLDOWN_DIR}/${CLUSTER_ID}.stamp"
+                last=0
+                [[ -f "${stamp}" ]] && last="$(cat "${stamp}" 2>/dev/null || echo 0)"
+                [[ "${last}" =~ ^[0-9]+$ ]] || last=0
+
+                age=$(( now_epoch - last ))
+                if (( last > 0 && age < cooldown_sec )); then
+                  echo "INFO: cooldown ativo p/ ${NAME} (id=${CLUSTER_ID}). Pulando auto-apply."
+                  gchat_send "$(printf "%s\n" \
+                    "⏳ Cooldown" \
+                    "🎲 Cluster => '${NAME}' | (${KIND})" \
+                    "🪪 id=${CLUSTER_ID}" \
+                    "⌚️Última checagem: ${CHECK_TS_HUMAN}." \
+                    "🚫 Não disparei resize (cooldown ativo)."
+                  )"
+                else
+                  echo "INFO: disparando resize job para ${NAME} (id=${CLUSTER_ID}) com +${PCT_TO_APPLY}% ..."
+                  resp="$(rundeck_run_resize_job "${CLUSTER_ID}" "${NAME}" "${PCT_TO_APPLY}" || true)"
+                  exec_id="$(jq -r '.id // .execution.id // empty' <<< "${resp}" 2>/dev/null || true)"
+
+                  if [[ -n "${exec_id}" ]]; then
+                    echo "OK: resize job disparado. execution_id=${exec_id}"
+                    gchat_send "$(printf "%s\n" \
+                      "✅ Resize disparado" \
+                      "🎲 Cluster => '${NAME}' | (${KIND})" \
+                      "🪪 id=${CLUSTER_ID}" \
+                      "📈 Aumento: +${PCT_TO_APPLY}%" \
+                      "🧾 Execução: ${exec_id}" \
+                      "⌚️Última checagem: ${CHECK_TS_HUMAN}."
+                    )"
+                    echo "${now_epoch}" > "${stamp}"
+                  else
+                    echo "WARN: não consegui identificar execution id. Resposta: ${resp}"
+                    gchat_send "$(printf "%s\n" \
+                      "⚠️ Falha ao disparar resize" \
+                      "🎲 Cluster => '${NAME}' | (${KIND})" \
+                      "🪪 id=${CLUSTER_ID}" \
+                      "⌚️Última checagem: ${CHECK_TS_HUMAN}." \
+                      "🔎 Verifique o Rundeck (não identifiquei execution id)."
+                    )"
+                  fi
+                fi
+              fi
+            fi
+
+            # ============================================================
+            # 13) Persistência NDJSON por instância
+            # ============================================================
+            jq -n \
+              --arg checked_at "${CHECK_TS_ISO}" \
+              --arg name "$NAME" \
+              --arg id "$CLUSTER_ID" \
+              --arg status "$STATUS" \
+              --arg engine_id "$ENGINE_ID" \
+              --arg engine_kind "$KIND" \
+              --arg engine_name "$ENAME" \
+              --arg volume_gib "$SIZE_GIB_PROV" \
+              --arg ip_private "${DB_IP:-}" \
+              --arg mountpoint "$EFFECTIVE_MP" \
+              --arg node_url "$NODE_URL" \
+              --arg app_url "$APP_URL" \
+              --arg node_ok "$NODE_OK" \
+              --arg app_ok "$APP_OK" \
+              --arg disk_used_gib "$DISK_USED_GIB" \
+              --arg disk_free_gib "$DISK_FREE_GIB" \
+              --arg disk_total_gib "$DISK_TOTAL_GIB" \
+              --arg disk_used_pct "$DISK_USED_PCT" \
+              --arg level "$LEVEL" \
+              --arg pct_to_apply "${PCT_TO_APPLY:-}" \
+              --arg auto_apply "${AUTO_APPLY}" \
+              '{
+                checked_at:$checked_at,
+                name:$name,
+                id:$id,
+                status:$status,
+                engine:{id:$engine_id,kind:$engine_kind,name:$engine_name},
+                volume:{provisioned_gib:($volume_gib|tonumber)},
+                network:{ip_private:$ip_private},
+                metrics:{
+                  mountpoint:$mountpoint,
+                  node:{url:$node_url,ok:($node_ok=="true")},
+                  app:{url:$app_url,ok:($app_ok=="true")},
+                  disk:{
+                    used_gib:($disk_used_gib|if .=="" then null else (.|tonumber) end),
+                    free_gib:($disk_free_gib|if .=="" then null else (.|tonumber) end),
+                    total_gib:($disk_total_gib|if .=="" then null else (.|tonumber) end),
+                    used_pct:($disk_used_pct|if .=="" then null else (.|tonumber) end)
+                  }
+                },
+                decision:{
+                  level:$level,
+                  suggested_increase_pct:($pct_to_apply|if .=="" then null else (.|tonumber) end),
+                  auto_apply:($auto_apply=="1")
+                }
+              }' >> "${OUT_NDJSON}"
+
+          done < <(jq -c '.results[]' <<< "$LIST_JSON")
+
+          # ============================================================
+          # 14) NDJSON -> JSON array
+          # ============================================================
+          jq -s '.' "${OUT_NDJSON}" > "${OUT_JSON}"
+          rm -f "${OUT_NDJSON}"
+          echo "Relatório salvo em: ${OUT_JSON}"
+
+  plugins:
+    ExecutionLifecycle: {}

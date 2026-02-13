@@ -1,0 +1,92 @@
+- defaultTab: output
+  description: Cria um Load Balancer na MGC com base nas instâncias atuais
+  executionEnabled: true
+  id: create-lb-cpen5-se
+  loglevel: INFO
+  name: Criar Load Balancer - CPEN5-SE
+  nodeFilterEditable: false
+  options:
+  - description: Chave de API da MGC
+    name: MGCAPIKEY
+    required: true
+    secure: true
+    storagePath: keys/project/monitoring/MGCAPIKEY
+    valueExposed: true
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |
+        #!/bin/bash
+        export MGC_AUTH_TYPE=api-key
+        MGCAPIKEY=$RD_OPTION_MGCAPIKEY
+        VPC_ID=$(mgc network vpcs list --api-key="$MGCAPIKEY" --output json | \
+          sed 's/\x1B\[[0-9;]*[mK]//g' | \
+          jq -r '.vpcs[] | select(.is_default == true) | .id')
+        LB_NAME="teste-lb-will-cpen5-se"
+        HEALTH_NAME="nlb-health-check-cpen5-se"
+        BACKEND_NAME="nlb-backend-cpen5-se"
+        LISTENER_NAME="nlb-listener-cpen5-ne"
+
+        echo "VPC default ID: $VPC_ID"
+        if [ -z "$VPC_ID" ]; then
+          echo "❌ Nenhuma VPC default encontrada."
+          exit 1
+        fi
+
+        echo "🔍 Coletando NICs das instâncias com prefixo 'app-'..."
+        NIC_IDS=$(mgc virtual-machine instances list --api-key="$MGCAPIKEY" --output json | \
+          sed 's/\x1B\[[0-9;]*[mK]//g' | \
+          jq -r '.instances[] | select(.name | test("^app")) | .network.interfaces[0].id')
+
+        if [ -z "$NIC_IDS" ]; then
+          echo "❌ Erro: Nenhuma NIC encontrada. Abortando execução."
+          exit 1
+        fi
+
+        echo "✅ NICs encontrados:"
+        echo "$NIC_IDS"
+        echo
+
+        TARGETS_JSON=$(echo "$NIC_IDS" | awk '{print "{\"nic_id\":\"" $1 "\",\"port\":80}"}' | paste -sd "," -)
+
+        echo "📦 JSON final dos targets:"
+        echo "[$TARGETS_JSON]"
+        echo
+
+        echo "🚀 Criando Load Balancer: $LB_NAME"
+
+        mgc load-balancer network-loadbalancers create \
+          --backends="[{
+            \"balance_algorithm\":\"round_robin\",
+            \"description\":\"Auto-generated backend\",
+            \"health_check_name\":\"$HEALTH_NAME\",
+            \"name\":\"$BACKEND_NAME\",
+            \"targets\":[$TARGETS_JSON],
+            \"targets_type\":\"instance\"}]" \
+          --health-checks="[{
+            \"healthy_status_code\":200,
+            \"name\":\"$HEALTH_NAME\",
+            \"path\":\"/health-check\",
+            \"port\":80,
+            \"healthy_threshold_count\":3,
+            \"initial_delay_seconds\":10,
+            \"interval_seconds\":10,
+            \"protocol\":\"tcp\"
+          }]" \
+          --listeners="[{
+            \"backend_name\":\"$BACKEND_NAME\",
+            \"name\":\"$LISTENER_NAME\",
+            \"port\":80,
+            \"protocol\":\"tcp\"
+          }]" \
+          --vpc-id="$VPC_ID" \
+          --visibility='external' \
+          --name="$LB_NAME" \
+          --api-key="$MGCAPIKEY"
+    keepgoing: false
+    strategy: node-first
+  uuid: create-lb-cpen5-se

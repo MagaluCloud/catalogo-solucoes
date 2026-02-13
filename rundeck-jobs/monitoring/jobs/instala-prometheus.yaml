@@ -1,0 +1,593 @@
+- defaultTab: nodes
+  description: "Esse script e instala o Prometheus em cada VM do ambiente (além de\
+    \ coletar os IPs como já faz), você pode fazer isso de forma paralela ou sequencial,\
+    \ usando ssh com chave previamente autorizada ou outro mecanismo de acesso (Rundeck\
+    \ plugin, Ansible, etc).\n\nAbaixo está a versão adaptada do seu script, que assume:\n\
+    \t1.\tVocê tem uma chave SSH configurada com acesso root ou sudo às VMs.\n\t2.\t\
+    O nome da chave SSH é passado por uma variável ou está no padrão ~/.ssh/id_rsa.\n\
+    \t3.\tO IP privado será usado para conectar (então deve haver rota, ou VPN/SG\
+    \ permitindo).\n\t4.\tA instalação do Prometheus será feita via apt (Ubuntu),\
+    \ com systemctl para iniciar o serviço."
+  executionEnabled: true
+  id: a3b5cfa6-fc27-4006-bc2e-5a2b5fed381c
+  loglevel: INFO
+  name: 'Instala prometheus '
+  nodeFilterEditable: false
+  options:
+  - name: API_KEY
+  - description: '    '
+    label: ssh
+    name: SSH_KEY_FILE
+    type: file
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |+
+        #!/bin/bash
+        set -euo pipefail
+
+        API_KEY="${RD_OPTION_API_KEY:-}"
+        SSH_USER="ubuntu"
+        #SSH_KEY="${RD_KEYFILE:-}"
+        #SSH_KEY="/var/lib/rundeck/projects/monitoring/managed_services"
+        API_KEY="${RD_OPTION_API_KEY:-}"
+        SSH_USER="ubuntu"
+        SSH_KEY="${RD_FILE_SSH_KEY_FILE:-}"
+
+        if [[ -z "$API_KEY" ]]; then
+          echo "❌ ERRO: API Key não informada."
+          exit 1
+        fi
+
+        if [[ -z "$SSH_KEY" ]]; then
+          echo "❌ ERRO: Chave SSH não foi enviada."
+          exit 1
+        fi
+
+        chmod 600 "$SSH_KEY"
+
+        echo "🔐 Autenticando na MGC via --api-key..."
+
+        if [[ -z "$API_KEY" ]]; then
+          echo "❌ ERRO: API Key não informada."
+          exit 1
+        fi
+
+        echo "🔐 Autenticando na MGC via --api-key..."
+
+        OUTPUT=$(mgc virtual-machine instances list --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+
+        echo "📋 Instâncias encontradas:"
+        echo "$OUTPUT" | jq -r '.instances[] | "\(.name) - Interface(s): \(.network.interfaces[].id)"'
+
+
+        echo "🔍 Listando interfaces das VMs..."
+
+        INSTANCE_JSON=$(mgc virtual-machine instances list --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+
+        echo "$INSTANCE_JSON" | jq -c '.instances[]' | while read -r VM; do
+          NAME=$(echo "$VM" | jq -r '.name')
+          for IFACE_ID in $(echo "$VM" | jq -r '.network.interfaces[].id'); do
+            echo "🔎 Consultando IP da interface $IFACE_ID da VM $NAME..."
+            PORT_JSON=$(mgc network ports get --port-id="$IFACE_ID" --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+
+            IP=$(echo "$PORT_JSON" | jq -r '.ip_address[]? | select(.ethertype == "IPv4") | .ip_address')
+
+            if [[ -n "$IP" ]]; then
+              echo "✅ $NAME -> $IP"
+            else
+              echo "⚠️  Nenhum IP IPv4 encontrado para $NAME"
+            fi
+          done
+        done
+
+        INSTANCE_JSON=$(mgc virtual-machine instances list --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+
+        echo "$INSTANCE_JSON" | jq -c '.instances[]' | while read -r VM; do
+          NAME=$(echo "$VM" | jq -r '.name')
+          for IFACE_ID in $(echo "$VM" | jq -r '.network.interfaces[].id'); do
+            PORT_JSON=$(mgc network ports get --port-id="$IFACE_ID" --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+            IP=$(echo "$PORT_JSON" | jq -r '.ip_address[]? | select(.ethertype == "IPv4") | .ip_address')
+
+            if [[ -n "$IP" ]]; then
+              echo "🔗 Conectando em $NAME ($IP)..."
+              ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$SSH_USER@$IP" "hostname"
+              echo "✅ Conexão OK para $NAME"
+            else
+              echo "⚠️  IP não encontrado para $NAME"
+            fi
+          done
+        done
+
+        # Script Etapa 4 - Instalação idempotente do Prometheus + Node Exporter via SSH
+        # ==============================================================
+        # ✅ Este script roda no Rundeck e se conecta via SSH nas VMs da MGC
+        # ✅ Ele detecta IPs privados, evita sobrescrever instalações existentes
+        # ==============================================================
+
+        #!/bin/bash
+        #set -euo pipefail
+
+        # ==== CONFIGURAÇÕES INICIAIS ====
+        #API_KEY="${RD_OPTION_API_KEY:-}"
+        ##SSH_USER="ubuntu"
+        #SSH_KEY="/var/lib/rundeck/keys/project/monitoring/manaded-services"
+
+        if [[ -z "$API_KEY" ]]; then
+          echo "❌ ERRO: API Key não definida."
+          exit 1
+        fi
+
+        # ==== BUSCA DAS INSTÂNCIAS ====
+        echo "🔐 Autenticando na MGC via --api-key..."
+        INSTANCE_JSON=$(mgc virtual-machine instances list --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+
+        # ==== LOOP POR CADA VM ====
+        echo "$INSTANCE_JSON" | jq -c '.instances[]' | while read -r VM; do
+          NAME=$(echo "$VM" | jq -r '.name')
+          for IFACE_ID in $(echo "$VM" | jq -r '.network.interfaces[].id'); do
+            PORT_JSON=$(mgc network ports get --port-id="$IFACE_ID" --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+            IP=$(echo "$PORT_JSON" | jq -r '.ip_address[]? | select(.ethertype == "IPv4") | .ip_address')
+
+            if [[ -n "$IP" ]]; then
+              echo "🚀 Instalando Prometheus + Node Exporter em $NAME ($IP)..."
+
+        # ==== CONEXÃO SSH E INSTALAÇÃO REMOTA ====
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$IP" 'bash -s' <<'EOF'
+        sudo bash <<'EOSUDO'
+        set -e
+
+        PROM_VERSION="2.52.0"
+        NODE_VERSION="1.8.1"
+
+        # ==== PROMETHEUS: CRIAÇÃO DE USUÁRIO E DIRETÓRIOS ====
+        useradd --no-create-home --shell /bin/false prometheus 2>/dev/null || true
+        mkdir -p /etc/prometheus /var/lib/prometheus
+        cd /tmp
+
+        # ==== PROMETHEUS: DOWNLOAD E DESCOMPACTAÇÃO ====
+        if [[ ! -f prometheus-${PROM_VERSION}.linux-amd64.tar.gz ]]; then
+          wget -q https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz
+        fi
+
+        tar -xzf prometheus-${PROM_VERSION}.linux-amd64.tar.gz
+        cd prometheus-${PROM_VERSION}.linux-amd64
+
+        # ==== PROMETHEUS: INSTALAÇÃO DOS BINÁRIOS ====
+        if [[ ! -f /usr/local/bin/prometheus ]]; then
+          cp prometheus promtool /usr/local/bin/
+          chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool
+        else
+          echo "ℹ️ Binários Prometheus já instalados. Pulando cópia."
+        fi
+
+        # ==== PROMETHEUS: CONFIGURAÇÃO YAML ====
+        cat <<EOPROM > /etc/prometheus/prometheus.yml
+        global:
+          scrape_interval: 15s
+        scrape_configs:
+          - job_name: 'prometheus'
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: 'node_exporter'
+            static_configs:
+              - targets: ['localhost:9100']
+        EOPROM
+
+        chown -R prometheus:prometheus /etc/prometheus /var/lib/prometheus
+
+        # ==== PROMETHEUS: SERVIÇO SYSTEMD ====
+        cat <<EOSVC > /etc/systemd/system/prometheus.service
+        [Unit]
+        Description=Prometheus Monitoring
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        User=prometheus
+        ExecStart=/usr/local/bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/var/lib/prometheus/ \
+          --web.console.templates=/etc/prometheus/consoles \
+          --web.console.libraries=/etc/prometheus/console_libraries
+
+        [Install]
+        WantedBy=multi-user.target
+        EOSVC
+
+        systemctl daemon-reexec
+        systemctl enable prometheus
+
+        if systemctl is-active --quiet prometheus; then
+          echo "ℹ️ Prometheus já está rodando."
+        else
+          echo "🔄 Iniciando Prometheus..."
+          systemctl restart prometheus
+        fi
+
+        # ==== NODE EXPORTER: USUÁRIO E DOWNLOAD ====
+        useradd --no-create-home --shell /bin/false node_exporter 2>/dev/null || true
+        cd /tmp
+
+        if [[ ! -f node_exporter-${NODE_VERSION}.linux-amd64.tar.gz ]]; then
+          wget -q https://github.com/prometheus/node_exporter/releases/download/v${NODE_VERSION}/node_exporter-${NODE_VERSION}.linux-amd64.tar.gz
+        fi
+
+        tar -xzf node_exporter-${NODE_VERSION}.linux-amd64.tar.gz
+
+        # ==== NODE EXPORTER: INSTALAÇÃO DO BINÁRIO ====
+        if [[ ! -f /usr/local/bin/node_exporter ]]; then
+          cp node_exporter-${NODE_VERSION}.linux-amd64/node_exporter /usr/local/bin/
+          chown node_exporter:node_exporter /usr/local/bin/node_exporter
+        else
+          echo "ℹ️ Binário Node Exporter já existe. Pulando cópia."
+        fi
+
+        # ==== NODE EXPORTER: SERVIÇO SYSTEMD ====
+        cat <<EOSVC2 > /etc/systemd/system/node_exporter.service
+        [Unit]
+        Description=Node Exporter
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        User=node_exporter
+        ExecStart=/usr/local/bin/node_exporter
+
+        [Install]
+        WantedBy=multi-user.target
+        EOSVC2
+
+        systemctl daemon-reexec
+        systemctl enable node_exporter
+
+        if systemctl is-active --quiet node_exporter; then
+          echo "ℹ️ Node Exporter já está rodando."
+        else
+          echo "🔄 Iniciando Node Exporter..."
+          systemctl restart node_exporter
+        fi
+
+        EOSUDO
+        EOF
+
+              echo "✅ Instalação concluída para $NAME ($IP)"
+            else
+              echo "⚠️  IP não encontrado para $NAME"
+            fi
+          done
+        done
+
+
+    - autoSecureInput: 'false'
+      description: Install Prometheus + Node Exporter via SSH
+      passSecureInput: 'false'
+      script: |-
+        # Script Etapa 4 - Instalação idempotente do Prometheus + Node Exporter via SSH
+        # ==============================================================
+        # ✅ Este script roda no Rundeck e se conecta via SSH nas VMs da MGC
+        # ✅ Ele detecta IPs privados, evita sobrescrever instalações existentes
+        # ==============================================================
+
+        #!/bin/bash
+        set -eu
+
+        # ==== CONFIGURAÇÕES INICIAIS ====
+        API_KEY="${RD_OPTION_API_KEY:-}"
+        SSH_USER="ubuntu"
+        SSH_KEY="/var/lib/rundeck/projects/monitoring/manaded-services"
+
+        if [[ -z "$API_KEY" ]]; then
+          echo "❌ ERRO: API Key não definida."
+          exit 1
+        fi
+
+        # ==== BUSCA DAS INSTÂNCIAS ====
+        echo "🔐 Autenticando na MGC via --api-key..."
+        INSTANCE_JSON=$(mgc virtual-machine instances list --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+
+        # ==== LOOP POR CADA VM ====
+        echo "$INSTANCE_JSON" | jq -c '.instances[]' | while read -r VM; do
+          NAME=$(echo "$VM" | jq -r '.name')
+          for IFACE_ID in $(echo "$VM" | jq -r '.network.interfaces[].id'); do
+            PORT_JSON=$(mgc network ports get --port-id="$IFACE_ID" --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+            IP=$(echo "$PORT_JSON" | jq -r '.ip_address[]? | select(.ethertype == "IPv4") | .ip_address')
+
+            if [[ -n "$IP" ]]; then
+              echo "🚀 Instalando Prometheus + Node Exporter em $NAME ($IP)..."
+
+        # ==== CONEXÃO SSH E INSTALAÇÃO REMOTA ====
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$IP" 'bash -s' <<'EOF'
+        sudo bash <<'EOSUDO'
+        set -e
+
+        PROM_VERSION="2.52.0"
+        NODE_VERSION="1.8.1"
+
+        # ==== PROMETHEUS: CRIAÇÃO DE USUÁRIO E DIRETÓRIOS ====
+        useradd --no-create-home --shell /bin/false prometheus 2>/dev/null || true
+        mkdir -p /etc/prometheus /var/lib/prometheus
+        cd /tmp
+
+        # ==== PROMETHEUS: DOWNLOAD E DESCOMPACTAÇÃO ====
+        if [[ ! -f prometheus-${PROM_VERSION}.linux-amd64.tar.gz ]]; then
+          wget -q https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz
+        fi
+
+        tar -xzf prometheus-${PROM_VERSION}.linux-amd64.tar.gz
+        cd prometheus-${PROM_VERSION}.linux-amd64
+
+        # ==== PROMETHEUS: INSTALAÇÃO DOS BINÁRIOS ====
+        if [[ ! -f /usr/local/bin/prometheus ]]; then
+          cp prometheus promtool /usr/local/bin/
+          chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool
+        else
+          echo "ℹ️ Binários Prometheus já instalados. Pulando cópia."
+        fi
+
+        # ==== PROMETHEUS: CONFIGURAÇÃO YAML ====
+        cat <<EOPROM > /etc/prometheus/prometheus.yml
+        global:
+          scrape_interval: 15s
+        scrape_configs:
+          - job_name: 'prometheus'
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: 'node_exporter'
+            static_configs:
+              - targets: ['localhost:9100']
+        EOPROM
+
+        chown -R prometheus:prometheus /etc/prometheus /var/lib/prometheus
+
+        # ==== PROMETHEUS: SERVIÇO SYSTEMD ====
+        cat <<EOSVC > /etc/systemd/system/prometheus.service
+        [Unit]
+        Description=Prometheus Monitoring
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        User=prometheus
+        ExecStart=/usr/local/bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/var/lib/prometheus/ \
+          --web.console.templates=/etc/prometheus/consoles \
+          --web.console.libraries=/etc/prometheus/console_libraries
+
+        [Install]
+        WantedBy=multi-user.target
+        EOSVC
+
+        systemctl daemon-reexec
+        systemctl enable prometheus
+
+        if systemctl is-active --quiet prometheus; then
+          echo "ℹ️ Prometheus já está rodando."
+        else
+          echo "🔄 Iniciando Prometheus..."
+          systemctl restart prometheus
+        fi
+
+        # ==== NODE EXPORTER: USUÁRIO E DOWNLOAD ====
+        useradd --no-create-home --shell /bin/false node_exporter 2>/dev/null || true
+        cd /tmp
+
+        if [[ ! -f node_exporter-${NODE_VERSION}.linux-amd64.tar.gz ]]; then
+          wget -q https://github.com/prometheus/node_exporter/releases/download/v${NODE_VERSION}/node_exporter-${NODE_VERSION}.linux-amd64.tar.gz
+        fi
+
+        tar -xzf node_exporter-${NODE_VERSION}.linux-amd64.tar.gz
+
+        # ==== NODE EXPORTER: INSTALAÇÃO DO BINÁRIO ====
+        if [[ ! -f /usr/local/bin/node_exporter ]]; then
+          cp node_exporter-${NODE_VERSION}.linux-amd64/node_exporter /usr/local/bin/
+          chown node_exporter:node_exporter /usr/local/bin/node_exporter
+        else
+          echo "ℹ️ Binário Node Exporter já existe. Pulando cópia."
+        fi
+
+        # ==== NODE EXPORTER: SERVIÇO SYSTEMD ====
+        cat <<EOSVC2 > /etc/systemd/system/node_exporter.service
+        [Unit]
+        Description=Node Exporter
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        User=node_exporter
+        ExecStart=/usr/local/bin/node_exporter
+
+        [Install]
+        WantedBy=multi-user.target
+        EOSVC2
+
+        systemctl daemon-reexec
+        systemctl enable node_exporter
+
+        if systemctl is-active --quiet node_exporter; then
+          echo "ℹ️ Node Exporter já está rodando."
+        else
+          echo "🔄 Iniciando Node Exporter..."
+          systemctl restart node_exporter
+        fi
+
+        EOSUDO
+        EOF
+
+              echo "✅ Instalação concluída para $NAME ($IP)"
+            else
+              echo "⚠️  IP não encontrado para $NAME"
+            fi
+          done
+        done
+
+
+
+
+
+        # Script Etapa 4 - Instalação idempotente do Prometheus + Node Exporter via SSH
+        # ==============================================================
+        # ✅ Este script roda no Rundeck e se conecta via SSH nas VMs da MGC
+        # ✅ Ele detecta IPs privados, evita sobrescrever instalações existentes
+        # ==============================================================
+
+        #!/bin/bash
+        set -euo pipefail
+
+        # ==== CONFIGURAÇÕES INICIAIS ====
+        #API_KEY="${RD_OPTION_API_KEY:-}"
+        #SSH_USER="ubuntu"
+        #SSH_KEY="/var/lib/rundeck/keys/project/monitoring/manaded-services"
+
+        if [[ -z "$API_KEY" ]]; then
+          echo "❌ ERRO: API Key não definida."
+          exit 1
+        fi
+
+        # ==== BUSCA DAS INSTÂNCIAS ====
+        echo "🔐 Autenticando na MGC via --api-key..."
+        INSTANCE_JSON=$(mgc virtual-machine instances list --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+
+        # ==== LOOP POR CADA VM ====
+        echo "$INSTANCE_JSON" | jq -c '.instances[]' | while read -r VM; do
+          NAME=$(echo "$VM" | jq -r '.name')
+          for IFACE_ID in $(echo "$VM" | jq -r '.network.interfaces[].id'); do
+            PORT_JSON=$(mgc network ports get --port-id="$IFACE_ID" --api-key="$API_KEY" --output json | sed 's/\x1B\[[0-9;]*[mK]//g')
+            IP=$(echo "$PORT_JSON" | jq -r '.ip_address[]? | select(.ethertype == "IPv4") | .ip_address')
+
+            if [[ -n "$IP" ]]; then
+              echo "🚀 Instalando Prometheus + Node Exporter em $NAME ($IP)..."
+
+        # ==== CONEXÃO SSH E INSTALAÇÃO REMOTA ====
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$IP" 'bash -s' <<'EOF'
+        sudo bash <<'EOSUDO'
+        set -e
+
+        PROM_VERSION="2.52.0"
+        NODE_VERSION="1.8.1"
+
+        # ==== PROMETHEUS: CRIAÇÃO DE USUÁRIO E DIRETÓRIOS ====
+        useradd --no-create-home --shell /bin/false prometheus 2>/dev/null || true
+        mkdir -p /etc/prometheus /var/lib/prometheus
+        cd /tmp
+
+        # ==== PROMETHEUS: DOWNLOAD E DESCOMPACTAÇÃO ====
+        if [[ ! -f prometheus-${PROM_VERSION}.linux-amd64.tar.gz ]]; then
+          wget -q https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz
+        fi
+
+        tar -xzf prometheus-${PROM_VERSION}.linux-amd64.tar.gz
+        cd prometheus-${PROM_VERSION}.linux-amd64
+
+        # ==== PROMETHEUS: INSTALAÇÃO DOS BINÁRIOS ====
+        if [[ ! -f /usr/local/bin/prometheus ]]; then
+          cp prometheus promtool /usr/local/bin/
+          chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool
+        else
+          echo "ℹ️ Binários Prometheus já instalados. Pulando cópia."
+        fi
+
+        # ==== PROMETHEUS: CONFIGURAÇÃO YAML ====
+        cat <<EOPROM > /etc/prometheus/prometheus.yml
+        global:
+          scrape_interval: 15s
+        scrape_configs:
+          - job_name: 'prometheus'
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: 'node_exporter'
+            static_configs:
+              - targets: ['localhost:9100']
+        EOPROM
+
+        chown -R prometheus:prometheus /etc/prometheus /var/lib/prometheus
+
+        # ==== PROMETHEUS: SERVIÇO SYSTEMD ====
+        cat <<EOSVC > /etc/systemd/system/prometheus.service
+        [Unit]
+        Description=Prometheus Monitoring
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        User=prometheus
+        ExecStart=/usr/local/bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/var/lib/prometheus/ \
+          --web.console.templates=/etc/prometheus/consoles \
+          --web.console.libraries=/etc/prometheus/console_libraries
+
+        [Install]
+        WantedBy=multi-user.target
+        EOSVC
+
+        systemctl daemon-reexec
+        systemctl enable prometheus
+
+        if systemctl is-active --quiet prometheus; then
+          echo "ℹ️ Prometheus já está rodando."
+        else
+          echo "🔄 Iniciando Prometheus..."
+          systemctl restart prometheus
+        fi
+
+        # ==== NODE EXPORTER: USUÁRIO E DOWNLOAD ====
+        useradd --no-create-home --shell /bin/false node_exporter 2>/dev/null || true
+        cd /tmp
+
+        if [[ ! -f node_exporter-${NODE_VERSION}.linux-amd64.tar.gz ]]; then
+          wget -q https://github.com/prometheus/node_exporter/releases/download/v${NODE_VERSION}/node_exporter-${NODE_VERSION}.linux-amd64.tar.gz
+        fi
+
+        tar -xzf node_exporter-${NODE_VERSION}.linux-amd64.tar.gz
+
+        # ==== NODE EXPORTER: INSTALAÇÃO DO BINÁRIO ====
+        if [[ ! -f /usr/local/bin/node_exporter ]]; then
+          cp node_exporter-${NODE_VERSION}.linux-amd64/node_exporter /usr/local/bin/
+          chown node_exporter:node_exporter /usr/local/bin/node_exporter
+        else
+          echo "ℹ️ Binário Node Exporter já existe. Pulando cópia."
+        fi
+
+        # ==== NODE EXPORTER: SERVIÇO SYSTEMD ====
+        cat <<EOSVC2 > /etc/systemd/system/node_exporter.service
+        [Unit]
+        Description=Node Exporter
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        User=node_exporter
+        ExecStart=/usr/local/bin/node_exporter
+
+        [Install]
+        WantedBy=multi-user.target
+        EOSVC2
+
+        systemctl daemon-reexec
+        systemctl enable node_exporter
+
+        if systemctl is-active --quiet node_exporter; then
+          echo "ℹ️ Node Exporter já está rodando."
+        else
+          echo "🔄 Iniciando Node Exporter..."
+          systemctl restart node_exporter
+        fi
+
+        EOSUDO
+        EOF
+
+              echo "✅ Instalação concluída para $NAME ($IP)"
+            else
+              echo "⚠️  IP não encontrado para $NAME"
+            fi
+          done
+        done
+    keepgoing: false
+    strategy: node-first
+  uuid: a3b5cfa6-fc27-4006-bc2e-5a2b5fed381c

@@ -1,0 +1,195 @@
+- defaultTab: nodes
+  description: ''
+  executionEnabled: true
+  id: edf09d97-6e09-47a2-9ea5-ab022b5af265
+  loglevel: DEBUG
+  name: MGC -  Instance Backup
+  nodeFilterEditable: false
+  options:
+  - description: |-
+      Apikey para execução odo script.
+
+      Este campo é obrigatório
+    label: MgcApiKey
+    name: API_KEY
+    required: true
+    secure: true
+    valueExposed: true
+  - description: "Escreva aqui o nome ou parte do nome da vm que deseja realizar o\
+      \ backup. \nCaso esse valor seja passado em branco será realizado um backup\
+      \ do ambiente indeiro. "
+    label: Nome da VM
+    name: RD_OPTION_PREFIX_VM
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |-
+        #!/bin/bash
+        set -euo pipefail
+        
+        # =============================================================================
+        #  Rundeck Job: Backup de VMs (Snapshots) - Magalu Cloud (MGC)
+        #  Autor: Wilson Lucena
+        #  Descrição: Cria snapshots das VMs filtradas por nome/padrão, excluindo VMs k8s-*.
+        # =============================================================================
+        
+        APIKEY="${RD_OPTION_API_KEY:?API Key é obrigatória.}"
+        PREFIX_VM="${RD_OPTION_PREFIX_VM:-}"
+        KEEP_DAYS="${RD_OPTION_KEEP_DAYS:-7}"
+        LOG_FILE="/tmp/mgc-backup.log"
+        
+        # --- Verificações iniciais ---
+        command -v mgc >/dev/null 2>&1 || { echo "Erro: 'mgc' CLI não encontrado."; exit 1; }
+        command -v jq  >/dev/null 2>&1 || { echo "Erro: 'jq' não encontrado."; exit 1; }
+        
+        # Garante que o arquivo de log exista e seja gravável
+        touch "$LOG_FILE" 2>/dev/null || { echo "⚠️ Aviso: não foi possível criar $LOG_FILE. Usando stdout apenas."; LOG_FILE="/dev/null"; }
+        
+        echo "============================================================"
+        echo " Iniciando processo de backup das VMs (Magalu Cloud)"
+        if [ -z "$PREFIX_VM" ]; then
+          echo " Nenhum filtro informado → serão incluídas TODAS as VMs elegíveis"
+        else
+          echo " Filtro informado: ${PREFIX_VM}"
+        fi
+        echo " Retenção: ${KEEP_DAYS} dias"
+        echo "============================================================"
+        echo ""
+        
+        # --- Consultar instâncias ---
+        echo ">>> Consultando instâncias via API MGC..."
+        RAW_JSON=$(mgc virtual-machine instances list --api-key="$APIKEY" --output json 2>/dev/null | sed 's/\x1B\[[0-9;]*[mK]//g')
+        
+        if [ -z "$RAW_JSON" ]; then
+          echo "❌ Erro: Nenhum retorno obtido do comando mgc virtual-machine instances list."
+          exit 1
+        fi
+        
+        # Validar JSON e campo "instances"
+        if ! echo "$RAW_JSON" | jq -e '.instances' >/dev/null 2>&1; then
+          echo "⚠️ JSON inválido. Conteúdo capturado:"
+          echo "------------------------------------------------------------"
+          echo "$RAW_JSON"
+          echo "------------------------------------------------------------"
+          exit 1
+        fi
+        
+        # Extrair IDs e nomes das VMs (ignorando as que começam com 'k8s-')
+        ALL_VMS=$(
+          echo "$RAW_JSON" \
+            | jq -r '.instances[]
+                | select(.name | test("^(?i)k8s-") | not)
+                | .id + ":" + .name' \
+            | sort -u
+        )
+        
+        if [ -z "$ALL_VMS" ]; then
+          echo "Nenhuma instância elegível encontrada (todas filtradas)."
+          exit 0
+        fi
+        
+        echo ">>> Instâncias encontradas (excluindo k8s-*):"
+        echo "------------------------------------------------------------"
+        echo "$ALL_VMS" | awk -F':' '{printf " - ID: %-40s | Nome: %s\n", $1, $2}'
+        echo "------------------------------------------------------------"
+        echo ""
+        
+        # --- Função de filtro (por nome/padrão) ---
+        filter_vms() {
+          local patterns="$1"
+          local vms="$2"
+        
+          if [ -z "$patterns" ]; then
+            echo "$vms"
+            return
+          fi
+        
+          local result=""
+          IFS=',' read -ra ITEMS <<< "$patterns"
+          for item in "${ITEMS[@]}"; do
+            local pattern
+            pattern=$(echo "$item" | xargs)
+            [ -z "$pattern" ] && continue
+        
+            local match
+            match=$(echo "$vms" | grep -i "$pattern" || true)
+            if [ -n "$match" ]; then
+              result+="$match"$'\n'
+            fi
+          done
+        
+          echo "$result" | sed '/^$/d' | sort -u
+        }
+        
+        # --- Aplicar filtro de nomes (opcional) ---
+        VM_LIST=$(filter_vms "$PREFIX_VM" "$ALL_VMS")
+        
+        if [ -z "$VM_LIST" ]; then
+          echo "Nenhuma VM encontrada com o filtro informado."
+          exit 0
+        fi
+        
+        # --- Loop principal (linha a linha) ---
+        set +e  # Não interrompe o job em caso de erro individual
+        
+        echo "$VM_LIST" | while IFS=':' read -r VM_ID VM_NAME; do
+          [ -z "$VM_ID" ] && continue
+          [ -z "${VM_NAME:-}" ] && VM_NAME="unknown"
+        
+          # Nome do snapshot (sanitiza + trunc para 50 chars)
+          TS="$(date +%Y%m%d-%H%M)"
+          BASE="snap-${VM_NAME}-${TS}"
+          BASE="$(echo "$BASE" | tr -cd '[:alnum:]-_.')"
+          SNAP_NAME="${BASE:0:50}"
+        
+          echo ""
+          echo ">>> Criando snapshot para VM: ${VM_NAME} (snapshot: ${SNAP_NAME})"
+        
+          if mgc virtual-machine snapshots create --instance.id="$VM_ID" --instance.name="$VM_NAME" --name "$SNAP_NAME" --api-key "$APIKEY"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') | VM: ${VM_NAME} | Snapshot: ${SNAP_NAME} | Status: OK" >> "$LOG_FILE"
+          else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') | VM: ${VM_NAME} | Snapshot: ${SNAP_NAME} | Status: ERRO" >> "$LOG_FILE"
+            echo "⚠️ Falha ao criar snapshot da VM ${VM_NAME}. Continuando..."
+            continue
+          fi
+        
+          echo ">>> Limpando snapshots antigos (> ${KEEP_DAYS} dias) da VM ${VM_NAME}..."
+        
+          # Cutoff calculado fora do jq (evita bug de aspas no date)
+          CUTOFF="$(date -d "${KEEP_DAYS} days ago" --iso-8601=seconds)"
+        
+          SNAP_OLD=$(
+            mgc virtual-machine snapshots list --instance.id "$VM_ID" --output json --api-key "$APIKEY" 2>/dev/null \
+              | sed 's/\x1B\[[0-9;]*[mK]//g' \
+              | jq -r --arg cutoff "$CUTOFF" '.[] | select(.createdAt < $cutoff) | .id'
+          )
+        
+          if [ -n "$SNAP_OLD" ]; then
+            echo "$SNAP_OLD" | while read -r SNAP_ID; do
+              [ -z "$SNAP_ID" ] && continue
+              echo " - Removendo snapshot antigo ID: $SNAP_ID"
+              if mgc virtual-machine snapshots delete --id "$SNAP_ID" --api-key "$APIKEY"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') | VM: ${VM_NAME} | Snapshot removido: ${SNAP_ID}" >> "$LOG_FILE"
+              else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') | VM: ${VM_NAME} | ERRO ao remover snapshot: ${SNAP_ID}" >> "$LOG_FILE"
+              fi
+            done
+          else
+            echo "Nenhum snapshot antigo encontrado para ${VM_NAME}."
+          fi
+        
+          echo ">>> Backup concluído para VM ${VM_NAME}"
+        done
+        
+        echo ""
+        echo "============================================================"
+        echo " Processo finalizado!"
+        echo " Logs disponíveis em: ${LOG_FILE}"
+        echo "============================================================"
+    keepgoing: false
+    strategy: node-first
+  uuid: edf09d97-6e09-47a2-9ea5-ab022b5af265

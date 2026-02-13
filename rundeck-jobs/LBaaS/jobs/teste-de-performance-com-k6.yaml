@@ -1,0 +1,173 @@
+- defaultTab: nodes
+  description: 'teste de performance'
+  executionEnabled: true
+  id: 8fd6b546-8f72-4784-940d-613365ecfb78
+  loglevel: INFO
+  name: 'Teste de performance com k6 '
+  nodeFilterEditable: false
+  options:
+  - description: interno ou externo
+    enforced: true
+    name: tipo_lb
+    required: true
+    values:
+    - interno
+    - externo
+    valuesListDelimiter: ','
+  - description: |
+      URL do Load Balancer (ex: http://10.0.0.1)
+    label: 'URL do Load Balancer (ex: http://10.0.0.1)'
+    name: target_url
+    required: true
+  - description: Número de usuários simultâneos
+    label: '100'
+    name: vus
+    required: true
+    value: '100'
+  - description: |
+      Tempo do teste (ex: 30s, 1m)
+    label: 'Tempo do teste (ex: 30s, 1m)'
+    name: duration
+    required: true
+    value: 30s
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |-
+        #!/bin/bash
+        set -e
+
+        VUS="$RD_OPTION_VUS"
+        DURATION="$RD_OPTION_DURATION"
+        TARGET_URL="$RD_OPTION_TARGET_URL"
+
+        TMP_DIR="/tmp/k6"
+        mkdir -p "$TMP_DIR"
+
+        if [[ "$RD_OPTION_TIPO_LB" == "externo" ]]; then
+          echo "🌐 Executando teste EXTERNO via k6 local"
+          TMP_SCRIPT="$TMP_DIR/test_$(date +%s).js"
+          TMP_LOG="$TMP_DIR/log_$(date +%s).log"
+
+          cat > "$TMP_SCRIPT" <<EOF
+        import http from 'k6/http';
+        import { check } from 'k6';
+
+        export let options = {
+          vus: $VUS,
+          duration: '$DURATION',
+        };
+
+        export default function () {
+          const res = http.get('$TARGET_URL');
+          check(res, {
+            'status 200': (r) => r.status === 200,
+          });
+        }
+        EOF
+
+          # === Verifica existência do arquivo ===
+          if [[ ! -f "$TMP_SCRIPT" ]]; then
+            echo "❌ ERRO: script K6 não foi criado."
+            exit 1
+          fi
+
+          # === Executa o teste e captura o código de retorno ===
+          echo "🚀 Executando teste com k6..."
+          k6 run "$TMP_SCRIPT" > "$TMP_LOG" 2>&1
+          EXIT_CODE=$?
+
+          echo ""
+          echo "📄 Últimas linhas do log do teste:"
+          echo "------------------------------------------"
+          tail -n 30 "$TMP_LOG"
+          echo "------------------------------------------"
+
+          if [[ "$EXIT_CODE" -ne 0 ]]; then
+            echo "❌ Teste terminou com erro (k6 exit code $EXIT_CODE)"
+          else
+            echo "✅ Teste finalizado com sucesso (k6 exit code 0)"
+          fi
+
+          exit $EXIT_CODE
+
+        elif [[ "$RD_OPTION_TIPO_LB" == "interno" ]]; then
+          echo "🏗️ Executando teste INTERNO via Kubernetes Job"
+
+          JOB_NAME="k6-test-$(date +%s)"
+          CM_NAME="k6-script-$JOB_NAME"
+
+          cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: $CM_NAME
+        data:
+          test.js: |
+            import http from 'k6/http';
+            import { check } from 'k6';
+
+            export let options = {
+              vus: Number(__ENV.vus),
+              duration: __ENV.duration,
+            };
+
+            export default function () {
+              const res = http.get(__ENV.target_url);
+              check(res, {
+                'status 200': (r) => r.status === 200,
+              });
+            }
+        ---
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: $JOB_NAME
+        spec:
+          template:
+            spec:
+              restartPolicy: Never
+              containers:
+              - name: k6
+                image: grafana/k6
+                command: ["k6", "run", "/test/test.js"]
+                env:
+                - name: vus
+                  value: "$VUS"
+                - name: duration
+                  value: "$DURATION"
+                - name: target_url
+                  value: "$TARGET_URL"
+                volumeMounts:
+                - name: script
+                  mountPath: /test
+              volumes:
+              - name: script
+                configMap:
+                  name: $CM_NAME
+        EOF
+
+          echo "⏳ Aguardando término do job..."
+          if ! kubectl wait --for=condition=complete job/$JOB_NAME --timeout=90s; then
+            echo "❌ Job não completou dentro do tempo limite."
+            exit 1
+          fi
+
+          echo ""
+          echo "📄 Últimas linhas do log do job:"
+          echo "------------------------------------------"
+          kubectl logs job/$JOB_NAME | tail -n 30
+          echo "------------------------------------------"
+
+          echo "✅ Job Kubernetes executado com sucesso"
+        else
+          echo "❌ tipo_lb inválido: $RD_OPTION_TIPO_LB"
+          exit 1
+        fi
+    keepgoing: false
+    strategy: node-first
+  uuid: 8fd6b546-8f72-4784-940d-613365ecfb78

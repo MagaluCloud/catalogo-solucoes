@@ -1,0 +1,104 @@
+- defaultTab: nodes
+  description: ''
+  executionEnabled: true
+  id: 8c0da083-5eb9-4b58-94e2-e7156573ced4
+  loglevel: INFO
+  name: Teste de performance com k6 diretamente no Rundeck
+  nodeFilterEditable: false
+  options:
+  - description: |
+      Tempo do teste (ex: 30s, 1m)
+    label: 'Tempo do teste (ex: 30s, 1m)'
+    name: duration
+    required: true
+    value: 30s
+  - description: |
+      URL do Load Balancer (ex: http://10.0.0.1)
+    label: 'URL do Load Balancer (ex: http://10.0.0.1)'
+    name: target_url
+    required: true
+  - description: Número de usuários simultâneos
+    label: '100'
+    name: vus
+    required: true
+    value: '100'
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |-
+        #!/bin/bash
+
+        set -e
+
+        # 🔒 Usa valores default caso venham vazios
+        VUS="$RD_OPTION_VUS"
+        DURATION="$RD_OPTION_DURATION"
+        TARGET_URL="$RD_OPTION_TARGET_URL"
+
+        TMP_SCRIPT="/tmp/k6-script.js"
+        TMP_LOG="/tmp/k6-output.log"
+
+        echo "✅ Iniciando teste com k6"
+        echo "🔗 URL: $TARGET_URL"
+        echo "👥 VUs: $VUS"
+        echo "⏱️ Duração: $DURATION"
+
+        # === Gera script JS do k6 ===
+        cat > "$TMP_SCRIPT" <<EOF
+        import http from 'k6/http';
+        import { check } from 'k6';
+
+        export let options = {
+          vus: Number($VUS),
+          duration: '$DURATION',
+          thresholds: {
+            http_req_duration: ['p(95)<500'],
+            checks: ['rate>0.95'],
+          }
+        };
+
+        export default function () {
+          const res = http.get('$TARGET_URL');
+          check(res, {
+            'status 200': (r) => {
+              const ok = r.status === 200;
+              if (!ok) {
+                console.log('❌ status inválido:', r.status);
+              }
+              return ok;
+            },
+          });
+        }
+        EOF
+
+        # === Verifica existência do arquivo ===
+        if [[ ! -f "$TMP_SCRIPT" ]]; then
+          echo "❌ ERRO: script K6 não foi criado."
+          exit 1
+        fi
+
+        # === Executa o teste e captura o código de retorno ===
+        echo "🚀 Executando teste com k6..."
+        k6 run "$TMP_SCRIPT" > "$TMP_LOG" 2>&1
+        EXIT_CODE=$?
+
+        echo ""
+        echo "📄 Últimas linhas do log do teste:"
+        echo "------------------------------------------"
+        tail -n 30 "$TMP_LOG"
+        echo "------------------------------------------"
+
+        if [[ "$EXIT_CODE" -ne 0 ]]; then
+          echo "❌ Teste terminou com erro (k6 exit code $EXIT_CODE)"
+        else
+          echo "✅ Teste finalizado com sucesso (k6 exit code 0)"
+        fi
+
+        exit $EXIT_CODE
+    keepgoing: false
+    strategy: node-first
+  uuid: 8c0da083-5eb9-4b58-94e2-e7156573ced4

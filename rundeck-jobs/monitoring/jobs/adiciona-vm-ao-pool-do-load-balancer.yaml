@@ -1,0 +1,80 @@
+- defaultTab: output
+  description: 'Varre o ambiente procurando por VMs que tenhham APP no nome e adiciona
+    ao load balancer '
+  executionEnabled: true
+  id: cupdate-lb-targets
+  loglevel: INFO
+  name: Adiciona VM ao  Pool do Load Balancer
+  nodeFilterEditable: false
+  options:
+  - description: Chave de API da MGC
+    name: MGCAPIKEY
+    required: true
+    secure: true
+    storagePath: keys/project/monitoring/MGCAPIKEY
+    valueExposed: true
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |-
+        #!/bin/bash
+
+        set -e
+
+        export MGC_AUTH_TYPE=api-key
+        #MGCAPIKEY=$RD_OPTION_MGCAPIKEY
+        MGCAPIKEY=09c23068-ccbe-4c23-bbe8-ad7fc9ff0ea5
+        LB_NAME="teste-lb-will-cpen5-se"
+
+        echo "🔄 Buscando informações do Load Balancer '$LB_NAME'..."
+        LB_DATA=$(mgc load-balancer network-loadbalancers list --api-key="$MGCAPIKEY" --output json | sed 's/\x1B\[[0-9;]*[a-zA-Z]//g')
+        LB_INFO=$(echo "$LB_DATA" | jq --arg NAME "$LB_NAME" '.results[] | select(.name == $NAME)')
+
+        LOAD_BALANCER_ID=$(echo "$LB_INFO" | jq -r '.id')
+        BACKEND_ID=$(echo "$LB_INFO" | jq -r '.backends[0].id')
+
+        echo "✅ Load Balancer ID: $LOAD_BALANCER_ID"
+        echo "✅ Backend ID: $BACKEND_ID"
+
+        echo "🔍 Coletando NICs de VMs com prefixo 'app-'..."
+        NIC_IDS=$(mgc virtual-machine instances list --api-key="$MGCAPIKEY" --output json --raw | \
+          sed 's/\x1B\[[0-9;]*[mK]//g' | \
+          jq -r '.instances[] | select(.name | test("^app-")) | .network.interfaces[0].id')
+
+        echo "✅  NICs  $NNIC_IDS "
+
+        if [ -z "$NIC_IDS" ]; then
+          echo "❌ Nenhuma NIC encontrada para instâncias app-*"
+          exit 1
+        fi
+
+        echo "📦 Montando JSON final dos targets..."
+        TARGETS_FINAL=$(echo "$NIC_IDS" | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({nic_id: ., port: 80})')
+        echo "$TARGETS_FINAL" | jq '.'
+
+        if [[ "$TARGETS_FINAL" == "[]" ]]; then
+          echo "❌ Nenhum target válido montado."
+          exit 1
+        fi
+
+        TARGETS_JSON=$(echo "$NIC_IDS" | awk '{print "{\"nic_id\":\"" $1 "\",\"port\":80}"}' | paste -sd "," -)
+
+        #--targets="$(echo "$NIC_IDS" | awk '{print "{\"id\":\"" $1 "\",\"nic_id\":\"" $1 "\",\"port\":80}"}' | jq -cs '.')" \
+
+        echo "🚀 Executando replace..."
+        mgc load-balancer network-backends replace \
+          --id="$BACKEND_ID" \
+          --load-balancer-id="$LOAD_BALANCER_ID" \
+          --backend-id="$BACKEND_ID" \
+          --targets="$(echo "$NIC_IDS" | awk '{print "{\"id\":\"" $1 "\",\"nic_id\":\"" $1 "\",\"port\":80}"}' | jq -cs '.')" \
+          --targets-type=instance \
+          --api-key="$MGCAPIKEY"
+
+        echo "✅ Replace concluído com sucesso."
+    keepgoing: false
+    strategy: node-first
+  uuid: cupdate-lb-targets

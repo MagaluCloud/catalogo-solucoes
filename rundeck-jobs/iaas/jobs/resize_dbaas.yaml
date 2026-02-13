@@ -1,0 +1,181 @@
+# ==============================================================================
+# Script: mgc-recize-disck-dbaas
+# Autor: Wilson Lucena 
+# Data: 2026-02-04
+# Descrição: Reaiza rezise automático dos bancos de dados   
+# ==============================================================================
+
+- id: mgc-recize-disck-dbaas
+  name: "MGC - DBaaS Disk Resize (+%)"
+  description: |-
+    Resize de disco (volume.size) em instâncias DBaaS na Magalu Cloud (MGC).
+
+    Comportamento:
+    - Sempre executa o resize (sem dry-run)
+    - Usa --no-confirm por padrão
+    - Exibe resumo final somente do que foi alterado (OK/FAIL)
+
+    Requisitos:
+    - mgc CLI no PATH
+    - jq instalado
+  loglevel: INFO
+  executionEnabled: true
+  nodeFilterEditable: false
+  defaultTab: nodes
+
+  options:
+    - name: API_KEY
+      label: "MGC API Key"
+      description: "API Key para autenticação no MGC (obrigatório)."
+      required: true
+      secure: true
+      valueExposed: true
+
+    - name: REGION
+      label: "Região"
+      description: "Região do serviço DBaaS"
+      required: true
+      value: "br-se1"
+      values:
+        - "br-se1"
+        - "br-ne1"
+        - "br-mgl1"
+
+    - name: INSTANCE_ID
+      label: "Instance ID (opcional)"
+      description: "Se informado, aplica apenas nessa instância (UUID)."
+      required: false
+
+    - name: INSTANCE_NAME
+      label: "Instance Name (opcional)"
+      description: "Se informado, aplica apenas na instância com esse nome (match exato)."
+      required: false
+
+    - name: PERCENT
+      label: "Percentual de aumento"
+      description: "Percentual a adicionar ao volume atual (ex: 50 = +50%)."
+      required: true
+      value: "50"
+
+  sequence:
+    strategy: node-first
+    keepgoing: false
+    commands:
+      - script: |-
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          API_KEY="${RD_OPTION_API_KEY}"
+          REGION="${RD_OPTION_REGION:-br-se1}"
+          FILTER_ID="${RD_OPTION_INSTANCE_ID:-}"
+          FILTER_NAME="${RD_OPTION_INSTANCE_NAME:-}"
+          PERCENT="${RD_OPTION_PERCENT:-50}"
+
+          MIN_SIZE=10
+          MAX_SIZE=50000
+
+          die() { echo "ERROR: $*" >&2; exit 1; }
+          log() { echo "[$(date +'%F %T')] $*"; }
+
+          need_cmd() { command -v "$1" >/dev/null 2>&1 || die "comando '$1' não encontrado"; }
+
+          ceil_div() {
+            echo $(( ($1 + $2 - 1) / $2 ))
+          }
+
+          calc_new_size() {
+            local old="$1"
+            local pct="$2"
+            local new
+            new="$(ceil_div $((old * (100 + pct))) 100)"
+            (( new <= old )) && new=$((old + 1))
+            (( new < MIN_SIZE )) && new="$MIN_SIZE"
+            (( new > MAX_SIZE )) && new="$MAX_SIZE"
+            echo "$new"
+          }
+
+          mgc_cmd() {
+            mgc --region "$REGION" --api-key "$API_KEY" "$@"
+          }
+
+          filter_json() {
+            # aplica filtros sem depender de subshell
+            local json="$1"
+
+            if [[ -n "$FILTER_ID" ]]; then
+              echo "$json" | jq --arg id "$FILTER_ID" '.results | map(select(.id == $id))'
+              return 0
+            fi
+
+            if [[ -n "$FILTER_NAME" ]]; then
+              echo "$json" | jq --arg name "$FILTER_NAME" '.results | map(select(.name == $name))'
+              return 0
+            fi
+
+            echo "$json" | jq '.results'
+          }
+
+          need_cmd mgc
+          need_cmd jq
+
+          [[ "$PERCENT" =~ ^[0-9]+$ ]] || die "PERCENT inválido: '$PERCENT' (use inteiro, ex: 50)"
+
+          log "Região=$REGION | Percentual=+$PERCENT% | no-confirm=ON"
+          [[ -n "$FILTER_ID" ]] && log "Filtro: instance-id=$FILTER_ID"
+          [[ -n "$FILTER_NAME" ]] && log "Filtro: instance-name=$FILTER_NAME"
+
+          raw_json="$(mgc_cmd dbaas instances list --raw --output json)"
+          instances="$(filter_json "$raw_json")"
+
+          total="$(echo "$instances" | jq 'length')"
+          (( total > 0 )) || die "Nenhuma instância encontrada"
+
+          log "Encontradas $total instância(s)."
+
+          declare -a SUMMARY=()
+          applied=0
+          failed=0
+          noop=0
+
+          # Loop no shell atual (SEM pipe), preserva arrays/contadores
+          while read -r inst; do
+            id="$(echo "$inst" | jq -r '.id')"
+            name="$(echo "$inst" | jq -r '.name')"
+            old="$(echo "$inst" | jq -r '.volume.size')"
+            new="$(calc_new_size "$old" "$PERCENT")"
+
+            if (( new == old )); then
+              log "Ignorado $name ($id): tamanho inalterado (${old}GiB)"
+              ((noop+=1))
+              continue
+            fi
+
+            log "Resize $name ($id): ${old}GiB → ${new}GiB"
+
+            if mgc_cmd dbaas instances resize \
+              --instance-id "$id" \
+              --volume.size "$new" \
+              --no-confirm \
+              --raw --output yaml; then
+              SUMMARY+=("$name | $id | $old → $new | OK")
+              ((applied+=1))
+            else
+              SUMMARY+=("$name | $id | $old → $new | FAIL")
+              ((failed+=1))
+            fi
+          done < <(echo "$instances" | jq -c '.[]')
+
+          echo
+          echo "==================== RESUMO FINAL ===================="
+          echo "name | id | old → new | status"
+          if ((${#SUMMARY[@]} == 0)); then
+            echo "(nenhuma alteração necessária)"
+          else
+            printf '%s\n' "${SUMMARY[@]}"
+          fi
+          echo "------------------------------------------------------"
+          echo "applied=$applied failed=$failed noop=$noop total=$total"
+          echo "======================================================"
+
+          # se quiser falhar o job quando houver FAIL, descomente:
+          # (( failed == 0 )) || exit 2
