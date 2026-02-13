@@ -1,0 +1,91 @@
+- defaultTab: output
+  description: "Varre o ambiente procurando por VMs que tenhham APP no nome, deleta\
+    \ e atualiza os nós do Grafana \n"
+  executionEnabled: true
+  id: remove-instances-and-update-grafana
+  loglevel: INFO
+  name: Remove-instances-and-update-grafana
+  nodeFilterEditable: false
+  options:
+  - description: Chave de API da MGC
+    name: MGCAPIKEY
+    required: true
+    secure: true
+    storagePath: keys/project/monitoring/MGCAPIKEY
+    valueExposed: true
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |-
+        #!/bin/bash
+        set -e
+
+        export MGC_AUTH_TYPE=api-key
+        API_KEY="$RD_OPTION_MGCAPIKEY"
+        TARGET_FILE="/etc/prometheus/hosts_app.yml"
+        TMP_FILE="/tmp/hosts_app.tmp.yml"
+
+        #######################################
+        # 1. Deleta instâncias com nome app-<número>
+        #######################################
+
+        echo "🔍 Buscando instâncias com padrão 'app-<número>'..."
+
+        INSTANCE_IDS=$(mgc virtual-machine instances list --api-key="$API_KEY" --output json | \
+          sed 's/\x1B\[[0-9;]*[mK]//g' | \
+          jq -r '.instances[] | select(.name | test("^app-[0-9]+$")) | .id')
+
+        if [[ -z "$INSTANCE_IDS" ]]; then
+          echo "ℹ️ Nenhuma instância encontrada com o padrão 'app-<número>'."
+        else
+          echo "🗑️ Deletando as seguintes instâncias:"
+          echo "$INSTANCE_IDS"
+          echo
+
+          for ID in $INSTANCE_IDS; do
+            echo "🔻 Deletando instância: $ID"
+            mgc virtual-machine instances delete --id="$ID" --no-confirm --api-key="$API_KEY"
+          done
+          echo "✅ Instâncias removidas."
+        fi
+
+        #######################################
+        # 2. Atualiza o arquivo de targets do Prometheus
+        #######################################
+
+        echo
+        echo "🔍 Buscando portas com nome contendo 'app-'..."
+
+        IPS=$(mgc network ports list --api-key="$API_KEY" --output json | \
+          sed 's/\x1B\[[0-9;]*[mK]//g' | \
+          jq -r '.[] | select(.name | test("app-")) | .ip_address[]? | select(.ethertype == "IPv4") | .ip_address')
+
+        if [ -z "$IPS" ]; then
+          echo "❌ Nenhum IP encontrado para portas com nome app-*"
+          exit 1
+        fi
+
+        echo "📄 Gerando novo arquivo de targets: $TMP_FILE"
+        echo "- targets:" > "$TMP_FILE"
+        for IP in $IPS; do
+          echo "  - \"$IP:9100\"" >> "$TMP_FILE"
+        done
+        echo "  labels:" >> "$TMP_FILE"
+        echo "    job: node_exporter" >> "$TMP_FILE"
+
+        echo "📦 Atualizando $TARGET_FILE..."
+        sudo cp "$TMP_FILE" "$TARGET_FILE"
+        sudo chown prometheus:prometheus "$TARGET_FILE"
+        rm -f "$TMP_FILE"
+
+        echo "🔁 Reiniciando Prometheus..."
+        sudo systemctl restart prometheus
+
+        echo "✅ Concluído. Acesse http://localhost:9090/targets para verificar os alvos atualizados."
+    keepgoing: false
+    strategy: node-first
+  uuid: remove-instances-and-update-grafana

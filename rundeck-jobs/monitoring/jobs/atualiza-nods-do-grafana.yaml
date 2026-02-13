@@ -1,0 +1,48 @@
+- defaultTab: output
+  description: 'Varre o ambiente procurando por VMs que tenhham APP no nome e adiciona
+    ao load balancer '
+  executionEnabled: true
+  id: atualiza-nodes-grafana
+  loglevel: INFO
+  name: 'Atualiza nods do grafana '
+  nodeFilterEditable: false
+  options:
+  - description: Chave de API da MGC
+    name: RD_OPTION_MGCAPIKEY
+    required: true
+    secure: true
+    storagePath: keys/project/monitoring/MGCAPIKEY
+    valueExposed: true
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: "#!/bin/bash\nset -euo pipefail\n\nAPI_KEY=\"${RD_OPTION_RD_OPTION_MGCAPIKEY:-}\"\
+        \nTARGET_FILE=\"/etc/prometheus/hosts_app.yml\"\nTMP_FILE=\"/tmp/hosts_app.tmp.yml\"\
+        \n\n# Verificação da API Key\nif [[ -z \"$API_KEY\" ]]; then\n  echo \"❌ ERRO:\
+        \ variável RD_OPTION_RD_OPTION_MGCAPIKEY não definida.\"\n  exit 1\nfi\n\n\
+        echo \"🔍 Buscando lista de instâncias...\"\nINSTANCE_IDS=$(mgc virtual-machine\
+        \ instances list --api-key=\"$RD_OPTION_RD_OPTION_MGCAPIKEY\" --output json\
+        \ | \\\n  sed 's/\\x1B\\[[0-9;]*[mK]//g' | jq -r '.instances[]?.id')\n\nif\
+        \ [[ -z \"$INSTANCE_IDS\" ]]; then\n  echo \"❌ Nenhuma instância encontrada.\"\
+        \n  exit 1\nfi\n\necho \"📡 Coletando IPs privados das instâncias...\"\nIPS=()\n\
+        \nfor ID in $INSTANCE_IDS; do\n  VM_JSON=$(mgc virtual-machine instances get\
+        \ \"$ID\" --api-key=\"$API_KEY\" --output json | sed 's/\\x1B\\[[0-9;]*[mK]//g')\n\
+        \  \n  PRIVATE_IP=$(echo \"$VM_JSON\" | jq -r '.network.interfaces[]?.ip_addresses.private_ipv4\
+        \ // empty')\n  NAME=$(echo \"$VM_JSON\" | jq -r '.name')\n\n  if [[ -n \"\
+        $PRIVATE_IP\" ]]; then\n    echo \"➡️  $NAME - $PRIVATE_IP\"\n    IPS+=(\"\
+        $PRIVATE_IP\")\n  fi\ndone\n\nif [[ ${#IPS[@]} -eq 0 ]]; then\n  echo \"❌\
+        \ Nenhum IP privado encontrado em nenhuma VM.\"\n  exit 1\nfi\n\necho \"📄\
+        \ Gerando arquivo temporário Prometheus: $TMP_FILE\"\n\n{\n  echo \"- targets:\"\
+        \n  for IP in \"${IPS[@]}\"; do\n    echo \"  - \\\"$IP:9100\\\"\"\n  done\n\
+        \  echo \"  labels:\"\n  echo \"    job: node_exporter\"\n} > \"$TMP_FILE\"\
+        \n\necho \"📦 Atualizando $TARGET_FILE...\"\nsudo cp \"$TMP_FILE\" \"$TARGET_FILE\"\
+        \nsudo chown prometheus:prometheus \"$TARGET_FILE\"\nrm -f \"$TMP_FILE\"\n\
+        \necho \"🔁 Reiniciando Prometheus...\"\nsudo systemctl restart prometheus\n\
+        \necho \"✅ Concluído!\"\necho \"➡️ Verifique os targets em: http://localhost:9090/targets\""
+    keepgoing: false
+    strategy: node-first
+  uuid: atualiza-nodes-grafana

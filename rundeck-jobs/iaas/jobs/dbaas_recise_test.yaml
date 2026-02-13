@@ -1,0 +1,368 @@
+- id: dbaas_resize_auto_discovery
+  defaultTab: output
+  description: "Auto discovery de DBaaS (API + métricas) para resize inteligente. Usa API_KEY + TENANT_ID (sem necessidade de login mgc)."
+  executionEnabled: true
+  loglevel: INFO
+  name: "MGC - DBaaS Metrics (API + node + mysql + postgres)"
+  nodeFilterEditable: false
+  scheduleEnabled: false
+
+  options:
+    - name: API_KEY
+      label: MGC API Key
+      description: "API Key do tenant (secure)."
+      required: true
+      secure: true
+      valueExposed: true
+
+    - name: TENANT_ID
+      label: Tenant ID
+      description: "UUID do tenant necessário para chamadas API (x-tenant-id). Ex: c2881b71-..."
+      required: true
+      value: ""
+
+    - name: REGION
+      label: Região (opcional)
+      description: "Ex: br-se1. Se vazio, o script tenta detectar automaticamente."
+      required: false
+      value: ""
+
+    - name: MOUNTPOINT
+      label: Mountpoint
+      description: "Mountpoint preferido para cálculo de uso. Se vazio ou '/', auto-detect escolhe disco de dados automaticamente."
+      required: false
+      value: "/"
+
+    - name: TIMEOUT
+      label: Timeout curl (segundos)
+      description: "Timeout para chamadas HTTP de métricas (padrão 4)."
+      required: false
+      value: "4"
+
+    - name: OUTPUT_DIR
+      label: Diretório de saída
+      description: "Onde salvar relatório JSON (padrão /var/log/rundeck)."
+      required: false
+      value: "/var/log/rundeck"
+
+    - name: SHOW_SAMPLE
+      label: Debug (0/1)
+      description: "1 mostra logs extra (ajuda em troubleshooting)."
+      required: false
+      value: "0"
+
+  sequence:
+    keepgoing: false
+    strategy: node-first
+    commands:
+      - description: "Executa coletor DBaaS metrics"
+        script: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # ============================================================
+          # 0) Inputs (Rundeck exporta options como env vars RD_OPTION_*)
+          # ============================================================
+          API_KEY="${RD_OPTION_API_KEY:-}"
+          TENANT_ID="${RD_OPTION_TENANT_ID:-}"
+          REGION="${RD_OPTION_REGION:-}"
+          MOUNTPOINT="${RD_OPTION_MOUNTPOINT:-/}"
+          TIMEOUT="${RD_OPTION_TIMEOUT:-4}"
+          OUTPUT_DIR="${RD_OPTION_OUTPUT_DIR:-/var/log/rundeck}"
+          SHOW_SAMPLE="${RD_OPTION_SHOW_SAMPLE:-0}"
+
+          # ============================================================
+          # 1) Validações básicas (sem vazar secrets)
+          # ============================================================
+          if [[ -z "${TENANT_ID}" ]]; then
+            echo "ERRO: TENANT_ID não informado (RD_OPTION_TENANT_ID vazio)."
+            exit 1
+          fi
+          if [[ -z "${API_KEY}" ]]; then
+            echo "ERRO: API_KEY não informada (RD_OPTION_API_KEY vazio)."
+            exit 1
+          fi
+
+          echo "OK: TENANT_ID=${TENANT_ID}"
+          echo "OK: API_KEY recebida (tamanho=${#API_KEY})"
+
+          # ============================================================
+          # 2) Pre-flight: dependências
+          # ============================================================
+          command -v mgc  >/dev/null 2>&1 || { echo "ERRO: mgc não encontrado no PATH"; exit 1; }
+          command -v jq   >/dev/null 2>&1 || { echo "ERRO: jq não encontrado no PATH"; exit 1; }
+          command -v curl >/dev/null 2>&1 || { echo "ERRO: curl não encontrado no PATH"; exit 1; }
+          command -v awk  >/dev/null 2>&1 || { echo "ERRO: awk não encontrado no PATH"; exit 1; }
+
+          # Remove sequências ANSI (cores)
+          strip_ansi() { sed -r 's/\x1B\[[0-9;]*[mK]//g'; }
+
+          if [[ "${SHOW_SAMPLE}" == "1" ]]; then
+            echo "DEBUG: mgc path: $(command -v mgc || true)"
+            echo "DEBUG: mgc version:"
+            mgc --version || true
+            echo
+          fi
+
+          # ============================================================
+          # 3) Helpers de API
+          # ============================================================
+          api_get() {
+            local url="$1"
+            curl -sS \
+              -H "x-api-key: ${API_KEY}" \
+              -H "x-tenant-id: ${TENANT_ID}" \
+              "$url"
+          }
+
+          # ============================================================
+          # 4) Detectar região (se vazio)
+          # ============================================================
+          detect_region() {
+            local regions=(br-se1 br-ne1 br-ne-1)
+            local r url code
+            for r in "${regions[@]}"; do
+              url="https://api.magalu.cloud/${r}/database/v2/instances"
+              code="$(curl -sS -o /dev/null -w "%{http_code}" \
+                -H "x-api-key: ${API_KEY}" \
+                -H "x-tenant-id: ${TENANT_ID}" \
+                "$url" || true)"
+              if [[ "$code" == "200" ]]; then
+                echo "$r"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          if [[ -z "${REGION}" ]]; then
+            REGION="$(detect_region || true)"
+            [[ -n "${REGION}" ]] || { echo "ERRO: não consegui detectar REGION automaticamente."; exit 1; }
+          fi
+
+          echo "OK: REGION=${REGION}"
+          echo "OK: MOUNTPOINT(preferido)=${MOUNTPOINT}"
+          echo "OK: TIMEOUT=${TIMEOUT}s"
+          echo
+
+          # ============================================================
+          # 5) Mapear engine_id -> tipo (mysql|postgres)
+          # ============================================================
+          ENGINES_JSON="$(
+            mgc dbaas engines list --status=ACTIVE --api-key "${API_KEY}" -o json --raw 2>/dev/null \
+            | strip_ansi
+          )"
+
+          declare -A ENGINE_KIND ENGINE_NAME
+          while IFS=$'\t' read -r id name; do
+            lname="$(echo "$name" | tr '[:upper:]' '[:lower:]')"
+            ENGINE_NAME["$id"]="$name"
+            if [[ "$lname" == *mysql* ]]; then
+              ENGINE_KIND["$id"]="mysql"
+            elif [[ "$lname" == *postgres* ]]; then
+              ENGINE_KIND["$id"]="postgres"
+            else
+              ENGINE_KIND["$id"]="unknown"
+            fi
+          done < <(jq -r '.results[] | "\(.id)\t\(.name)"' <<< "$ENGINES_JSON")
+
+          # ============================================================
+          # 6) Listar instâncias DBaaS via API
+          # ============================================================
+          LIST_URL="https://api.magalu.cloud/${REGION}/database/v2/instances"
+          LIST_JSON="$(api_get "${LIST_URL}")"
+
+          echo "DBaaS:"
+          jq -r '.results[] | " - \(.name)\t\(.id)\t\(.volume.size)GiB\t\(.status)"' <<< "$LIST_JSON"
+          echo
+
+          # ============================================================
+          # 7) Preparar arquivo de relatório
+          # ============================================================
+          TS="$(date +%Y%m%d-%H%M%S)"
+          mkdir -p "${OUTPUT_DIR}"
+          OUT_JSON="${OUTPUT_DIR}/dbaas-metrics-${TS}.json"
+          OUT_NDJSON="${OUT_JSON}.ndjson"
+          : > "${OUT_NDJSON}"
+
+          # ============================================================
+          # 8) Loop por instância (SEM pipe; evita subshells e surpresas)
+          # ============================================================
+          while IFS= read -r inst; do
+            INSTANCE_ID="$(jq -r '.id' <<< "$inst")"
+
+            D="$(api_get "https://api.magalu.cloud/${REGION}/database/v2/instances/${INSTANCE_ID}")"
+
+            NAME="$(jq -r '.name' <<< "$D")"
+            STATUS="$(jq -r '.status' <<< "$D")"
+            SIZE_GIB_PROV="$(jq -r '.volume.size' <<< "$D")"
+            ENGINE_ID="$(jq -r '.engine_id // empty' <<< "$D")"
+            KIND="${ENGINE_KIND[$ENGINE_ID]:-unknown}"
+            ENAME="${ENGINE_NAME[$ENGINE_ID]:-unknown}"
+
+            # Primeiro IPv4 PRIVATE (sem head)
+            DB_IP="$(jq -r '([.addresses[]? | select(.access=="PRIVATE" and .type=="IPv4") | .address] | .[0]) // empty' <<< "$D")"
+
+            NODE_URL=""
+            APP_URL=""
+            NODE_OK=false
+            APP_OK=false
+
+            DISK_USED_GIB=""
+            DISK_FREE_GIB=""
+            DISK_TOTAL_GIB=""
+            DISK_USED_PCT=""
+
+            EFFECTIVE_MP="${MOUNTPOINT}"
+
+            if [[ -n "${DB_IP}" ]]; then
+              NODE_URL="http://${DB_IP}:8080/node/metrics"
+
+              if curl -sS --max-time "${TIMEOUT}" "${NODE_URL}" >/dev/null 2>&1; then
+                NODE_OK=true
+                METRICS="$(curl -sS --max-time "${TIMEOUT}" "${NODE_URL}")"
+
+                # ------------------------------------------------------------
+                # Auto-detect seguro (MySQL + Postgres)
+                # - prioridade: /mnt/database-data
+                # - fallback: maior filesystem (ignorando mounts de sistema)
+                # ------------------------------------------------------------
+                if [[ -z "${MOUNTPOINT}" || "${MOUNTPOINT}" == "/" ]]; then
+                  AUTO_MP="$(awk '
+                    $0 ~ /^node_filesystem_size_bytes\{/ && $0 !~ /fstype="tmpfs"/ {
+                      if (match($0, /mountpoint="[^"]+"/)) {
+                        mp = substr($0, RSTART+12, RLENGTH-13)
+                        if (mp ~ /^\/run/ || mp=="/boot" || mp=="/boot/efi" || mp=="/proc" || mp=="/sys") next
+                        size = $NF
+                        if (mp == "/mnt/database-data") preferred = mp
+                        if (size > best) { best = size; bestmp = mp }
+                      }
+                    }
+                    END {
+                      if (preferred != "") print preferred;
+                      else if (bestmp != "") print bestmp;
+                    }
+                  ' <<< "$METRICS")"
+                  EFFECTIVE_MP="${AUTO_MP:-/}"
+                fi
+
+                # ------------------------------------------------------------
+                # Coleta size/avail (awk entende notação científica)
+                # ------------------------------------------------------------
+                SIZE_B="$(awk -v mp="${EFFECTIVE_MP}" '
+                  $0 ~ /^node_filesystem_size_bytes\{/ &&
+                  $0 ~ "mountpoint=\""mp"\"" &&
+                  $0 !~ /fstype="tmpfs"/ { val=$NF }
+                  END { if (val!="") print val }
+                ' <<< "$METRICS")"
+
+                AVAIL_B="$(awk -v mp="${EFFECTIVE_MP}" '
+                  $0 ~ /^node_filesystem_avail_bytes\{/ &&
+                  $0 ~ "mountpoint=\""mp"\"" &&
+                  $0 !~ /fstype="tmpfs"/ { val=$NF }
+                  END { if (val!="") print val }
+                ' <<< "$METRICS")"
+
+                # ------------------------------------------------------------
+                # Cálculo 100% em awk (evita bash + notação científica)
+                # ------------------------------------------------------------
+                if [[ -n "${SIZE_B}" && -n "${AVAIL_B}" ]]; then
+                  read -r DISK_USED_GIB DISK_FREE_GIB DISK_TOTAL_GIB DISK_USED_PCT < <(
+                    awk -v size="${SIZE_B}" -v avail="${AVAIL_B}" '
+                      BEGIN {
+                        s = size + 0
+                        a = avail + 0
+                        if (s <= 0) exit 0
+                        u = s - a
+                        gib = 1024*1024*1024
+                        printf "%.2f %.2f %.2f %.2f\n", (u/gib), (a/gib), (s/gib), ((u/s)*100)
+                      }
+                    '
+                  )
+                fi
+
+                if [[ "${SHOW_SAMPLE}" == "1" ]]; then
+                  echo "DEBUG: ${NAME} mp=${EFFECTIVE_MP} size_b=${SIZE_B:-NA} avail_b=${AVAIL_B:-NA}"
+                fi
+              fi
+
+              # endpoint engine
+              case "$KIND" in
+                mysql)    APP_URL="http://${DB_IP}:8080/mysql/metrics" ;;
+                postgres) APP_URL="http://${DB_IP}:8080/postgres/metrics" ;;
+                *)        APP_URL="" ;;
+              esac
+
+              if [[ -n "${APP_URL}" ]]; then
+                if curl -sS --max-time "${TIMEOUT}" "${APP_URL}" >/dev/null 2>&1; then
+                  APP_OK=true
+                fi
+              fi
+            fi
+
+            # ------------------------------------------------------------
+            # Log resumido
+            # ------------------------------------------------------------
+            echo "== ${NAME} | ${KIND} =="
+            echo "id=${INSTANCE_ID} status=${STATUS} prov=${SIZE_GIB_PROV}GiB ip=${DB_IP:-N/A}"
+            if [[ "${NODE_OK}" == "true" && -n "${DISK_USED_PCT}" ]]; then
+              echo "disk(${EFFECTIVE_MP}) used=${DISK_USED_GIB}GiB free=${DISK_FREE_GIB}GiB total=${DISK_TOTAL_GIB}GiB used%=${DISK_USED_PCT}%"
+            else
+              echo "disk(${EFFECTIVE_MP}) N/A"
+            fi
+            echo "node_metrics=${NODE_OK} app_metrics=${APP_OK}"
+            echo
+
+            # ------------------------------------------------------------
+            # Persistência NDJSON
+            # ------------------------------------------------------------
+            jq -n \
+              --arg name "$NAME" \
+              --arg id "$INSTANCE_ID" \
+              --arg status "$STATUS" \
+              --arg engine_id "$ENGINE_ID" \
+              --arg engine_kind "$KIND" \
+              --arg engine_name "$ENAME" \
+              --arg volume_gib "$SIZE_GIB_PROV" \
+              --arg ip_private "${DB_IP:-}" \
+              --arg mountpoint "$EFFECTIVE_MP" \
+              --arg node_url "$NODE_URL" \
+              --arg app_url "$APP_URL" \
+              --arg node_ok "$NODE_OK" \
+              --arg app_ok "$APP_OK" \
+              --arg disk_used_gib "$DISK_USED_GIB" \
+              --arg disk_free_gib "$DISK_FREE_GIB" \
+              --arg disk_total_gib "$DISK_TOTAL_GIB" \
+              --arg disk_used_pct "$DISK_USED_PCT" \
+              '{
+                name:$name,
+                id:$id,
+                status:$status,
+                engine:{id:$engine_id,kind:$engine_kind,name:$engine_name},
+                volume:{provisioned_gib:($volume_gib|tonumber)},
+                network:{ip_private:$ip_private},
+                metrics:{
+                  mountpoint:$mountpoint,
+                  node:{url:$node_url,ok:($node_ok=="true")},
+                  app:{url:$app_url,ok:($app_ok=="true")},
+                  disk:{
+                    used_gib:($disk_used_gib|if .=="" then null else (.|tonumber) end),
+                    free_gib:($disk_free_gib|if .=="" then null else (.|tonumber) end),
+                    total_gib:($disk_total_gib|if .=="" then null else (.|tonumber) end),
+                    used_pct:($disk_used_pct|if .=="" then null else (.|tonumber) end)
+                  }
+                }
+              }' >> "${OUT_NDJSON}"
+
+          done < <(jq -c '.results[]' <<< "$LIST_JSON")
+
+          # ============================================================
+          # 9) NDJSON -> JSON array
+          # ============================================================
+          jq -s '.' "${OUT_NDJSON}" > "${OUT_JSON}"
+          rm -f "${OUT_NDJSON}"
+
+          echo "Relatório salvo em: ${OUT_JSON}"
+
+  plugins:
+    ExecutionLifecycle: {}

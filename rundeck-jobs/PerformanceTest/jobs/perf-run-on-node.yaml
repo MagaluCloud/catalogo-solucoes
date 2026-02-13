@@ -1,0 +1,206 @@
+- defaultTab: nodes
+  description: Executa testes (cpu|mem|disk|net|all) em UMA VM cujo nome você informar.
+    Marca janela no Prometheus via textfile collector.
+  executionEnabled: true
+  group: performance
+  id: 6b6b77e2-1f1e-4b2c-9d3e-111111111111
+  loglevel: INFO
+  name: perf-run-on-node
+  nodeFilterEditable: true
+  nodefilters:
+    dispatch:
+      excludePrecedence: true
+      keepgoing: false
+      rankOrder: ascending
+      successOnEmptyNodeFilter: false
+      threadcount: '1'
+    filter: 'name: ${option.NODE_NAME}'
+  nodesSelectedByDefault: true
+  options:
+  - description: Nome exato do nó/VM onde o job deve rodar
+    name: NODE_NAME
+    required: true
+  - description: Tipo de teste
+    name: MODE
+    required: true
+    value: all
+    values:
+    - cpu
+    - mem
+    - disk
+    - net
+    - all
+    valuesListDelimiter: ','
+  - description: Duração (s)
+    name: DURATION
+    required: true
+    value: '60'
+  - description: 'Workers de CPU (padrão: nproc)'
+    name: CPU_WORKERS
+  - description: '% de memória para stress-ng (ex.: 80)'
+    name: MEM_PCT
+    value: '80'
+  - description: 'Arquivo/dispositivo para fio (ex.: /tmp/fio_testfile ou /dev/nvme0n1
+      -> cuidado!)'
+    name: FIO_FILE
+    value: /tmp/fio_testfile
+  - description: 'Tamanho do arquivo (ex.: 2G)'
+    name: FIO_SIZE
+    value: 2G
+  - description: Profundidade de fila
+    name: FIO_IODEPTH
+    value: '32'
+  - description: Block size
+    name: FIO_BS
+    value: 4k
+  - description: Padrão de I/O
+    name: FIO_RW
+    value: randrw
+  - description: Servidor iperf3 (IP/host) quando MODE=net ou no all
+    name: NET_SERVER
+  - description: Conexões paralelas do iperf3 (-P)
+    name: NET_PARALLEL
+    value: '4'
+  - description: 'Se true, inicia iperf3 -s neste nó antes do teste'
+    name: SETUP_IPERF_SERVER
+    value: 'false'
+    values:
+    - 'true'
+    - 'false'
+    valuesListDelimiter: ','
+  plugins:
+    ExecutionLifecycle: null
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - description: Preparar host e rodar teste
+      script: |
+        set -euo pipefail
+
+        # --- Dependências ---
+        if ! command -v stress-ng >/dev/null 2>&1; then
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y stress-ng fio iperf3
+          elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y epel-release || true
+            sudo yum install -y stress-ng fio iperf3
+          elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y stress-ng fio iperf3
+          fi
+        fi
+
+        # --- Garantir textfile collector no Node Exporter ---
+        sudo mkdir -p /var/lib/node_exporter/textfile
+        if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q '^node_exporter\.service'; then
+          if ! (ps -eo cmd | grep -v grep | grep -q -- '--collector.textfile.directory='); then
+            NE_BIN="$(command -v node_exporter || echo /usr/local/bin/node_exporter)"
+            sudo mkdir -p /etc/systemd/system/node_exporter.service.d
+            cat <<EOF | sudo tee /etc/systemd/system/node_exporter.service.d/override.conf >/dev/null
+        [Service]
+        ExecStart=
+        ExecStart=${NE_BIN} --collector.textfile.directory=/var/lib/node_exporter/textfile
+        EOF
+            sudo systemctl daemon-reload || true
+          fi
+          sudo systemctl restart node_exporter || true
+        fi
+
+        # --- (Opcional) habilitar servidor iperf3 neste nó ---
+        if [[ "${RD_OPTION_SETUP_IPERF_SERVER:-false}" == "true" ]]; then
+          cat <<'EOF' | sudo tee /etc/systemd/system/iperf3-server.service >/dev/null
+        [Unit]
+        Description=iperf3 server
+        After=network.target
+        [Service]
+        ExecStart=/usr/bin/iperf3 -s
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now iperf3-server || true
+        fi
+
+        # --- Script de teste (perf-run.sh) ---
+        cat <<'EOS' >/tmp/perf-run.sh
+        #!/usr/bin/env bash
+        set -euo pipefail
+        DURATION="${DURATION:-60}"           # segundos
+        MODE="${MODE:-all}"                  # cpu|mem|disk|net|all
+        CPU_WORKERS="${CPU_WORKERS:-$(nproc)}"
+        MEM_PCT="${MEM_PCT:-80}"
+        FIO_FILE="${FIO_FILE:-/tmp/fio_testfile}"
+        FIO_SIZE="${FIO_SIZE:-2G}"
+        FIO_IODEPTH="${FIO_IODEPTH:-32}"
+        FIO_BS="${FIO_BS:-4k}"
+        FIO_RW="${FIO_RW:-randrw}"
+        NET_SERVER="${NET_SERVER:-}"
+        NET_PARALLEL="${NET_PARALLEL:-4}"
+
+        TEXTDIR="/var/lib/node_exporter/textfile"
+        METRIC_FILE="$TEXTDIR/perf_test.prom"
+        HOST="$(hostname)"
+        TS="$(date +%Y%m%d-%H%M%S)"
+        LOGDIR="/var/log/perftests/${TS}"
+        sudo mkdir -p "$TEXTDIR" "$LOGDIR"
+
+        mark_start(){ cat > "$METRIC_FILE" <<EOF
+        perf_test_active 1
+        perf_test_info{host="$HOST",mode="$MODE"} 1
+        EOF
+        }
+        mark_end(){
+          local EPOCH; EPOCH="$(date +%s)"
+          rm -f "$METRIC_FILE" || true
+          cat > "$TEXTDIR/perf_test_last_completed.prom" <<EOF
+        perf_test_last_completed{host="$HOST",mode="$MODE"} $EPOCH
+        EOF
+        }
+
+        test_cpu(){ echo "[CPU] $DURATION s, workers=$CPU_WORKERS"; stress-ng --cpu "$CPU_WORKERS" --cpu-method matrixprod --timeout "${DURATION}"s --metrics-brief | tee "$LOGDIR/cpu.txt"; }
+        test_mem(){ echo "[MEM] $DURATION s, vm-bytes=${MEM_PCT}%"; stress-ng --vm 1 --vm-bytes "${MEM_PCT}%" --timeout "${DURATION}"s --metrics-brief | tee "$LOGDIR/mem.txt"; }
+        test_disk(){
+          echo "[DISK] $DURATION s, file=$FIO_FILE size=$FIO_SIZE iodepth=$FIO_IODEPTH bs=$FIO_BS rw=$FIO_RW"
+          fio --name=perftest --filename="$FIO_FILE" --size="$FIO_SIZE" --direct=1 \
+              --rw="$FIO_RW" --bs="$FIO_BS" --iodepth="$FIO_IODEPTH" \
+              --ioengine=libaio --time_based=1 --runtime="$DURATION" \
+              --group_reporting=1 | tee "$LOGDIR/disk.txt"
+        }
+        test_net(){
+          [[ -z "${NET_SERVER}" ]] && { echo "NET_SERVER não definido (ex.: NET_SERVER=10.0.0.10)"; exit 1; }
+          echo "[NET] $DURATION s, server=$NET_SERVER, parallel=$NET_PARALLEL"
+          iperf3 -c "$NET_SERVER" -t "$DURATION" -P "$NET_PARALLEL" | tee "$LOGDIR/net.txt"
+        }
+
+        mark_start
+        case "$MODE" in
+          cpu) test_cpu ;;
+          mem) test_mem ;;
+          disk) test_disk ;;
+          net) test_net ;;
+          all) test_cpu; test_mem; test_disk; [[ -n "${NET_SERVER}" ]] && test_net || true ;;
+          *) echo "MODE inválido: $MODE"; exit 2 ;;
+        esac
+        mark_end
+        echo "Logs em: $LOGDIR"
+        EOS
+        sudo mv /tmp/perf-run.sh /usr/local/bin/perf-run.sh
+        sudo chmod +x /usr/local/bin/perf-run.sh
+
+        # --- Executar teste ---
+        sudo DURATION="${RD_OPTION_DURATION:-60}" \
+             MODE="${RD_OPTION_MODE:-all}" \
+             CPU_WORKERS="${RD_OPTION_CPU_WORKERS:-$(nproc)}" \
+             MEM_PCT="${RD_OPTION_MEM_PCT:-80}" \
+             FIO_FILE="${RD_OPTION_FIO_FILE:-/tmp/fio_testfile}" \
+             FIO_SIZE="${RD_OPTION_FIO_SIZE:-2G}" \
+             FIO_IODEPTH="${RD_OPTION_FIO_IODEPTH:-32}" \
+             FIO_BS="${RD_OPTION_FIO_BS:-4k}" \
+             FIO_RW="${RD_OPTION_FIO_RW:-randrw}" \
+             NET_SERVER="${RD_OPTION_NET_SERVER:-}" \
+             NET_PARALLEL="${RD_OPTION_NET_PARALLEL:-4}" \
+             /usr/local/bin/perf-run.sh
+    keepgoing: false
+    strategy: node-first
+  uuid: 6b6b77e2-1f1e-4b2c-9d3e-111111111111

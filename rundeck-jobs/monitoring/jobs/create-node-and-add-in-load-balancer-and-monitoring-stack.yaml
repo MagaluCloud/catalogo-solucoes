@@ -1,0 +1,74 @@
+- defaultTab: output
+  description: 'O que faz esse Job: Procura por um snapshot que tenha app no nome
+    e o restaura. Coleta o IP privado dessa máquina Adiciona essa MV no pool do Load
+    Balancer - LB Atualiza o Prometheus para que ele consiga enxhergar essa MV'
+  executionEnabled: true
+  id: add-nodes-in-app-pool
+  loglevel: INFO
+  name: create node and add in load balancer and monitoring stack
+  nodeFilterEditable: false
+  options:
+  - description: Chave de API da MGC
+    name: MGCAPIKEY
+    required: true
+    secure: true
+    storagePath: keys/project/monitoring/MGCAPIKEY
+    valueExposed: true
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: "#!/bin/bash\nset -e\n\n# =========[ CONFIG ]=========\nexport MGC_AUTH_TYPE=api-key\n\
+        API_KEY=\"$RD_OPTION_MGCAPIKEY\"\nSSH_KEY=\"managed-services\"\nMACHINE_TYPE_ID=\"\
+        0122fb85-0fd0-47d1-bf25-f24ca6f11493\"\nLB_NAME=\"teste-lb-will-cpen5-se\"\
+        \nTMP_FILE=\"/tmp/hosts_app.tmp.yml\"\nTARGET_FILE=\"/etc/prometheus/hosts_app.yml\"\
+        \n# ============================\n\n# =========[ RESTAURA VM ]=========\n\
+        SUFFIX=$(date +%s)\nVM_NAME=\"app-$SUFFIX\"\necho \"🔍 Buscando snapshot com\
+        \ prefixo 'app-'...\"\nSNAPSHOT_ID=$(mgc virtual-machine snapshots list --api-key=\"\
+        $API_KEY\" --output json | \\\n  sed 's/\\x1B\\[[0-9;]*[mK]//g' | \\\n  jq\
+        \ -r '.snapshots[] | select(.name | test(\"app-\")) | .id' | head -n 1)\n\n\
+        if [ -z \"$SNAPSHOT_ID\" ]; then\n  echo \"❌ Nenhum snapshot com 'app-' encontrado.\"\
+        \n  exit 1\nfi\n\necho \"📦 Snapshot selecionado: $SNAPSHOT_ID\"\necho \"🚀\
+        \ Restaurando instância com nome: $VM_NAME\"\nmgc virtual-machine snapshots\
+        \ restore \\\n  --name=\"$VM_NAME\" \\\n  --id=\"$SNAPSHOT_ID\" \\\n  --ssh-key-name=\"\
+        $SSH_KEY\" \\\n  --machine-type.id=\"$MACHINE_TYPE_ID\" \\\n  --api-key=\"\
+        $API_KEY\"\n  \nsleep 90\n\n# =========[ ATUALIZA LOAD BALANCER ]=========\n\
+        echo \"🔄 Buscando Load Balancer '$LB_NAME'...\"\nLB_DATA=$(mgc load-balancer\
+        \ network-loadbalancers list --api-key=\"$API_KEY\" --output json | sed 's/\\\
+        x1B\\[[0-9;]*[a-zA-Z]//g')\nLB_INFO=$(echo \"$LB_DATA\" | jq --arg NAME \"\
+        $LB_NAME\" '.results[] | select(.name == $NAME)')\nLOAD_BALANCER_ID=$(echo\
+        \ \"$LB_INFO\" | jq -r '.id')\nBACKEND_ID=$(echo \"$LB_INFO\" | jq -r '.backends[0].id')\n\
+        \necho \"✅ Load Balancer ID: $LOAD_BALANCER_ID\"\necho \"✅ Backend ID: $BACKEND_ID\"\
+        \n\necho \"🔍 Coletando NICs de VMs com prefixo 'app-'...\"\nNIC_IDS=$(mgc\
+        \ virtual-machine instances list --api-key=\"$API_KEY\" --output json --raw\
+        \ | \\\n  sed 's/\\x1B\\[[0-9;]*[mK]//g' | \\\n  jq -r '.instances[] | select(.name\
+        \ | test(\"^app-\")) | .network.interfaces[0].id')\n\nif [ -z \"$NIC_IDS\"\
+        \ ]; then\n  echo \"❌ Nenhuma NIC encontrada para instâncias app-*\"\n  exit\
+        \ 1\nfi\n\necho \"📦 Montando JSON final dos targets...\"\nTARGETS_JSON=$(echo\
+        \ \"$NIC_IDS\" | awk '{print \"{\\\"id\\\":\\\"\" $1 \"\\\",\\\"nic_id\\\"\
+        :\\\"\" $1 \"\\\",\\\"port\\\":80}\"}' | jq -cs '.')\n\necho \"$TARGETS_JSON\"\
+        \ | jq '.'\n\necho \"🚀 Executando replace no Load Balancer...\"\nmgc load-balancer\
+        \ network-backends replace \\\n  --id=\"$BACKEND_ID\" \\\n  --load-balancer-id=\"\
+        $LOAD_BALANCER_ID\" \\\n  --backend-id=\"$BACKEND_ID\" \\\n  --targets=\"\
+        $TARGETS_JSON\" \\\n  --targets-type=instance \\\n  --api-key=\"$API_KEY\"\
+        \n\necho \"✅ Targets atualizados no Load Balancer\"\n\n# =========[ GERA HOSTS\
+        \ PARA PROMETHEUS ]=========\necho \"🌐 Buscando IPs de portas com nome contendo\
+        \ 'app-'...\"\nIPS=$(mgc network ports list --api-key=\"$API_KEY\" --output\
+        \ json | \\\n  sed 's/\\x1B\\[[0-9;]*[mK]//g' | \\\n  jq -r '.[] | select(.name\
+        \ | test(\"app-\")) | .ip_address[]? | select(.ethertype == \"IPv4\") | .ip_address')\n\
+        \nif [ -z \"$IPS\" ]; then\n  echo \"❌ Nenhum IP encontrado\"\n  exit 1\n\
+        fi\n\necho \"📝 Gerando arquivo temporário para Prometheus: $TMP_FILE\"\n\
+        echo \"- targets:\" > \"$TMP_FILE\"\nfor IP in $IPS; do\n  echo \"  - \\\"\
+        $IP:9100\\\"\" >> \"$TMP_FILE\"\ndone\necho \"  labels:\" >> \"$TMP_FILE\"\
+        \necho \"    job: node_exporter\" >> \"$TMP_FILE\"\n\necho \"📦 Substituindo\
+        \ $TARGET_FILE com novo conteúdo...\"\nsudo cp \"$TMP_FILE\" \"$TARGET_FILE\"\
+        \nsudo chown prometheus:prometheus \"$TARGET_FILE\"\nrm -f \"$TMP_FILE\"\n\
+        \necho \"🔁 Reiniciando Prometheus...\"\nsudo systemctl restart prometheus\n\
+        \necho \"✅ Todos os passos concluídos com sucesso!\"\necho \"🔗 Verifique:\
+        \ http://localhost:9090/targets\""
+    keepgoing: false
+    strategy: node-first
+  uuid: add-nodes-in-app-pool

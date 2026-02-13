@@ -1,0 +1,316 @@
+- id: mgc-object-storage-sync-path
+  name: "MGC - Object Storage - Sync path (local-ssh-nodes)"
+  #group: "MGC/Object-Storage"
+  description: "Envia um diretório para Object Storage (bucket/prefix). Suporta execução local, via SSH (IPs) ou em múltiplos nodes do Rundeck. Usa API_KEY (tenant) + OBJ_APIKEY_UUID (credencial atual do Object Storage via mgc object-storage api-key set)."
+  loglevel: INFO
+  defaultTab: output
+  executionEnabled: true
+  scheduleEnabled: false
+  nodeFilterEditable: true
+
+  options:
+    - name: API_KEY
+      label: MGC API Key (tenant)
+      description: "API Key do tenant (control plane)."
+      required: true
+      secure: true
+      valueExposed: true
+
+    - name: OBJ_APIKEY_UUID
+      label: Object Storage Credential UUID
+      description: "UUID da credencial do Object Storage para selecionar como CURRENT."
+      required: true
+
+    - name: CREATE_BUCKET_IF_MISSING
+      label: Criar bucket se não existir?
+      required: true
+      values: ["true", "false"]
+      value: "true"
+
+    - name: EXEC_TARGET
+      label: Onde executar?
+      required: true
+      values: [local, ssh, rundeck_nodes]
+      value: "local"
+
+    - name: NODE_FILTER
+      label: Filtro de Nodes (somente EXEC_TARGET=rundeck_nodes)
+      required: false
+      value: ".*"
+
+    - name: SSH_HOSTS
+      label: IPs/Hosts (somente EXEC_TARGET=ssh)
+      required: false
+      value: ""
+
+    - name: SSH_USER
+      label: SSH user (somente EXEC_TARGET=ssh)
+      required: false
+      value: "ubuntu"
+
+    - name: SSH_PORT
+      label: SSH port (somente EXEC_TARGET=ssh)
+      required: false
+      value: "22"
+
+    - name: SSH_KEY_PATH
+      label: Caminho da chave SSH (somente EXEC_TARGET=ssh)
+      required: false
+      value: ""
+
+    - name: REGION
+      label: Região
+      required: true
+      value: "br-se1"
+
+    - name: BUCKET
+      label: Bucket
+      description: "Nome do bucket (GLOBAL). Se já existir fora do tenant, não será possível criar."
+      required: true
+
+    - name: PREFIX
+      label: Prefixo (pasta no bucket)
+      required: false
+      value: ""
+
+    - name: LOCAL_PATH
+      label: Caminho local (no alvo escolhido)
+      required: true
+
+    - name: MODE
+      label: Modo de envio
+      required: true
+      values: [sync, upload-dir]
+      value: "sync"
+
+    - name: DELETE_NOT_PRESENT
+      label: "Sync: apagar no bucket o que não existe localmente?"
+      required: true
+      values: ["false", "true"]
+      value: "false"
+
+    - name: STORAGE_CLASS
+      label: Storage Class (somente MODE=upload-dir)
+      required: false
+      value: ""
+
+  nodefilters:
+    filter: "${option.NODE_FILTER}"
+
+  dispatch:
+    threadcount: 10
+    keepgoing: false
+    excludePrecedence: true
+
+  sequence:
+    keepgoing: false
+    strategy: node-first
+    commands:
+      - script: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+          EXEC_TARGET="${RD_OPTION_EXEC_TARGET}"
+
+          API_KEY="${RD_OPTION_API_KEY:-}"
+          OBJ_APIKEY_UUID="${RD_OPTION_OBJ_APIKEY_UUID:-}"
+          CREATE_BUCKET_IF_MISSING="${RD_OPTION_CREATE_BUCKET_IF_MISSING:-true}"
+
+          REGION="${RD_OPTION_REGION}"
+          BUCKET="${RD_OPTION_BUCKET}"
+          PREFIX="${RD_OPTION_PREFIX:-}"
+          LOCAL_PATH="${RD_OPTION_LOCAL_PATH}"
+          MODE="${RD_OPTION_MODE}"
+          DELETE_NOT_PRESENT="${RD_OPTION_DELETE_NOT_PRESENT}"
+          STORAGE_CLASS="${RD_OPTION_STORAGE_CLASS:-}"
+
+          SSH_HOSTS="${RD_OPTION_SSH_HOSTS:-}"
+          SSH_USER="${RD_OPTION_SSH_USER:-ubuntu}"
+          SSH_PORT="${RD_OPTION_SSH_PORT:-22}"
+          SSH_KEY_PATH="${RD_OPTION_SSH_KEY_PATH:-}"
+
+          [[ -n "${API_KEY}" ]] || { echo "ERRO: API_KEY não informada." >&2; exit 10; }
+          [[ -n "${OBJ_APIKEY_UUID}" ]] || { echo "ERRO: OBJ_APIKEY_UUID não informado." >&2; exit 11; }
+          [[ -n "${REGION}" ]] || { echo "ERRO: REGION é obrigatório." >&2; exit 12; }
+          [[ -n "${BUCKET}" ]] || { echo "ERRO: BUCKET é obrigatório." >&2; exit 13; }
+          [[ -n "${LOCAL_PATH}" ]] || { echo "ERRO: LOCAL_PATH é obrigatório." >&2; exit 14; }
+
+          command -v mgc >/dev/null 2>&1 || { echo "ERRO: 'mgc' não encontrado no PATH do alvo." >&2; exit 3; }
+          [[ -d "${LOCAL_PATH}" ]] || { echo "ERRO: LOCAL_PATH não existe no alvo: ${LOCAL_PATH}" >&2; exit 2; }
+
+          RD_NODE_NAME="${RD_NODE_NAME:-}"
+          RD_NODE_HOSTNAME="${RD_NODE_HOSTNAME:-}"
+          RD_NODE_IP="${RD_NODE_IPADDRESS:-}"
+
+          log "Job: ${RD_JOB_NAME:-"(n/a)"} | ID fixo: mgc-object-storage-sync-path"
+          log "Exec target: ${EXEC_TARGET}"
+          log "NodeName: ${RD_NODE_NAME:-"(n/a)"} | Hostname: ${RD_NODE_HOSTNAME:-"(n/a)"} | IP: ${RD_NODE_IP:-"(n/a)"}"
+
+          # Normaliza prefix
+          PREFIX="${PREFIX#/}"
+          [[ -z "$PREFIX" || "${PREFIX: -1}" == "/" ]] || PREFIX="${PREFIX}/"
+          DEST_URI="${BUCKET}/${PREFIX}"
+          log "Destino: ${DEST_URI} (region=${REGION})"
+          log "Credenciais: API_KEY=(set,len=${#API_KEY}) OBJ_APIKEY_UUID=${OBJ_APIKEY_UUID}"
+
+          # Seleciona credencial atual do Object Storage (necessário antes de objetos)
+          select_obj_cred() {
+            log "Selecionando credencial CURRENT do Object Storage: ${OBJ_APIKEY_UUID}"
+            mgc --api-key "${API_KEY}" object-storage api-key set --uuid "${OBJ_APIKEY_UUID}" --no-confirm -o table >/dev/null
+          }
+
+          ensure_bucket() {
+            log "Checando bucket (control plane)..."
+            if mgc --api-key "${API_KEY}" object-storage buckets list --region="${REGION}" -o json -r 2>/dev/null \
+                | grep -q "\"name\"[[:space:]]*:[[:space:]]*\"${BUCKET}\""; then
+              log "Bucket encontrado na lista do tenant: ${BUCKET}"
+              return 0
+            fi
+
+            if [[ "${CREATE_BUCKET_IF_MISSING}" != "true" ]]; then
+              log "Bucket não encontrado pelo tenant e CREATE_BUCKET_IF_MISSING=false. Não vou criar."
+              return 0
+            fi
+
+            log "Tentando criar bucket: ${BUCKET}"
+            set +e
+            out="$(mgc --api-key "${API_KEY}" object-storage buckets create "${BUCKET}" --region="${REGION}" --no-confirm -o json 2>&1)"
+            rc=$?
+            set -e
+
+            if [[ $rc -eq 0 ]]; then
+              log "Bucket criado: ${BUCKET}"
+              return 0
+            fi
+
+            if echo "$out" | grep -qiE "409|BucketAlreadyExists|name is not available"; then
+              echo "ERRO: Bucket '${BUCKET}' já existe no namespace global e não pode ser criado por este tenant." >&2
+              echo "Sugestão: use um nome único (ex: ${BUCKET}-${REGION}-${RD_PROJECT_NAME:-proj})." >&2
+              echo "$out" >&2
+              exit 21
+            fi
+
+            echo "ERRO ao criar bucket '${BUCKET}':" >&2
+            echo "$out" >&2
+            exit 22
+          }
+
+          run_objects() {
+            select_obj_cred
+            ensure_bucket
+
+            case "${MODE}" in
+              sync)
+                args=()
+                [[ "${DELETE_NOT_PRESENT}" == "true" ]] && args+=(--delete) && log "SYNC com --delete habilitado"
+                log "Executando: mgc object-storage objects sync"
+                mgc --api-key "${API_KEY}" object-storage objects sync \
+                  --region="${REGION}" \
+                  --local="${LOCAL_PATH}" \
+                  --bucket="${DEST_URI}" \
+                  "${args[@]}" \
+                  --no-confirm \
+                  -o table
+                ;;
+              upload-dir)
+                up_args=()
+                [[ -n "${STORAGE_CLASS}" ]] && up_args+=(--storage-class="${STORAGE_CLASS}") && log "Upload-dir com storage-class=${STORAGE_CLASS}"
+                log "Executando: mgc object-storage objects upload-dir"
+                mgc --api-key "${API_KEY}" object-storage objects upload-dir \
+                  --region="${REGION}" \
+                  --src="${LOCAL_PATH}" \
+                  --dst="${DEST_URI}" \
+                  "${up_args[@]}" \
+                  --no-confirm \
+                  -o table
+                ;;
+              *)
+                echo "ERRO: MODE inválido: ${MODE}" >&2
+                exit 4
+                ;;
+            esac
+          }
+
+          # local e rundeck_nodes executam o mesmo core
+          if [[ "${EXEC_TARGET}" == "local" || "${EXEC_TARGET}" == "rundeck_nodes" ]]; then
+            run_objects
+            log "Concluído ✅"
+            exit 0
+          fi
+
+          # SSH: executa o mesmo core remoto
+          if [[ "${EXEC_TARGET}" == "ssh" ]]; then
+            [[ -n "${SSH_HOSTS// /}" ]] || { echo "ERRO: informe SSH_HOSTS para EXEC_TARGET=ssh" >&2; exit 5; }
+
+            SSH_OPTS=(-p "${SSH_PORT}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+            [[ -n "${SSH_KEY_PATH}" ]] && SSH_OPTS+=(-i "${SSH_KEY_PATH}")
+
+            REMOTE_SCRIPT='
+              set -euo pipefail
+              log(){ echo "[$(date "+%Y-%m-%d %H:%M:%S")] $*"; }
+
+              API_KEY="$1"; OBJ_APIKEY_UUID="$2"; CREATE_BUCKET_IF_MISSING="$3"
+              REGION="$4"; BUCKET="$5"; PREFIX="$6"; LOCAL_PATH="$7"; MODE="$8"; DELETE_NOT_PRESENT="$9"; STORAGE_CLASS="${10:-}"
+
+              command -v mgc >/dev/null 2>&1 || { echo "ERRO: mgc não encontrado no remoto" >&2; exit 3; }
+              [[ -d "${LOCAL_PATH}" ]] || { echo "ERRO: LOCAL_PATH não existe no remoto: ${LOCAL_PATH}" >&2; exit 2; }
+
+              PREFIX="${PREFIX#/}"
+              [[ -z "$PREFIX" || "${PREFIX: -1}" == "/" ]] || PREFIX="${PREFIX}/"
+              DEST_URI="${BUCKET}/${PREFIX}"
+
+              log "Selecionando credencial CURRENT do Object Storage: ${OBJ_APIKEY_UUID}"
+              mgc --api-key "${API_KEY}" object-storage api-key set --uuid "${OBJ_APIKEY_UUID}" --no-confirm -o table >/dev/null
+
+              if mgc --api-key "${API_KEY}" object-storage buckets list --region="${REGION}" -o json -r 2>/dev/null | grep -q "\"name\"[[:space:]]*:[[:space:]]*\"${BUCKET}\""; then
+                log "Bucket encontrado na lista do tenant: ${BUCKET}"
+              else
+                if [[ "${CREATE_BUCKET_IF_MISSING}" != "true" ]]; then
+                  log "Bucket não encontrado e CREATE_BUCKET_IF_MISSING=false. Não vou criar."
+                else
+                  log "Tentando criar bucket: ${BUCKET}"
+                  set +e
+                  out="$(mgc --api-key "${API_KEY}" object-storage buckets create "${BUCKET}" --region="${REGION}" --no-confirm -o json 2>&1)"
+                  rc=$?
+                  set -e
+                  if [[ $rc -ne 0 ]] && echo "$out" | grep -qiE "409|BucketAlreadyExists|name is not available"; then
+                    echo "ERRO: Bucket '${BUCKET}' já existe no namespace global e não pode ser criado por este tenant." >&2
+                    echo "$out" >&2
+                    exit 21
+                  elif [[ $rc -ne 0 ]]; then
+                    echo "ERRO ao criar bucket '${BUCKET}':" >&2
+                    echo "$out" >&2
+                    exit 22
+                  fi
+                fi
+              fi
+
+              if [[ "${MODE}" == "sync" ]]; then
+                ARGS=()
+                [[ "${DELETE_NOT_PRESENT}" == "true" ]] && ARGS+=(--delete)
+                mgc --api-key "${API_KEY}" object-storage objects sync --region="${REGION}" --local="${LOCAL_PATH}" --bucket="${DEST_URI}" "${ARGS[@]}" --no-confirm -o table
+              else
+                UP_ARGS=()
+                [[ -n "${STORAGE_CLASS}" ]] && UP_ARGS+=(--storage-class="${STORAGE_CLASS}")
+                mgc --api-key "${API_KEY}" object-storage objects upload-dir --region="${REGION}" --src="${LOCAL_PATH}" --dst="${DEST_URI}" "${UP_ARGS[@]}" --no-confirm -o table
+              fi
+              log "Concluído (remote) ✅"
+            '
+
+            IFS=',' read -r -a HOSTS <<< "${SSH_HOSTS}"
+            for h in "${HOSTS[@]}"; do
+              host="$(echo "$h" | xargs)"
+              [[ -z "$host" ]] && continue
+              log "SSH -> ${SSH_USER}@${host}:${SSH_PORT}"
+              ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
+                "bash -s -- '${API_KEY}' '${OBJ_APIKEY_UUID}' '${CREATE_BUCKET_IF_MISSING}' '${REGION}' '${BUCKET}' '${PREFIX}' '${LOCAL_PATH}' '${MODE}' '${DELETE_NOT_PRESENT}' '${STORAGE_CLASS}'" \
+                <<< "${REMOTE_SCRIPT}"
+            done
+
+            log "Concluído (ssh multi-host) ✅"
+            exit 0
+          fi
+
+          echo "ERRO: EXEC_TARGET inválido: ${EXEC_TARGET}" >&2
+          exit 9

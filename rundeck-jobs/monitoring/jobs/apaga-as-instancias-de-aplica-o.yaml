@@ -1,0 +1,51 @@
+- defaultTab: output
+  description: 'Restaura snapshot '
+  executionEnabled: true
+  id: delete-targets
+  loglevel: INFO
+  name: 'Apaga as instancias de aplicação '
+  nodeFilterEditable: false
+  options:
+  - description: Chave de API da MGC
+    name: MGCAPIKEY
+    required: true
+    secure: true
+    storagePath: keys/project/monitoring/MGCAPIKEY
+    valueExposed: true
+  plugins:
+    ExecutionLifecycle: {}
+  scheduleEnabled: true
+  sequence:
+    commands:
+    - autoSecureInput: 'false'
+      passSecureInput: 'false'
+      script: |-
+        #!/bin/bash
+
+        export MGC_AUTH_TYPE=api-key
+        API_KEY="$RD_OPTION_MGCAPIKEY"  # ou defina manualmente
+
+        echo "🔍 Buscando instâncias com padrão 'app-<número>'..."
+
+        INSTANCE_IDS=$(mgc virtual-machine instances list --api-key="$API_KEY" --output json | \
+          sed 's/\x1B\[[0-9;]*[mK]//g' | \
+          jq -r '.instances[] | select(.name | test("^app-[0-9]+$")) | .id')
+
+        if [[ -z "$INSTANCE_IDS" ]]; then
+          echo "❌ Nenhuma instância encontrada com o padrão 'app-<número>'."
+          exit 0
+        fi
+
+        echo "🗑️ Deletando as seguintes instâncias:"
+        echo "$INSTANCE_IDS"
+        echo
+
+        for ID in $INSTANCE_IDS; do
+          echo "🔻 Deletando instância: $ID"
+          mgc virtual-machine instances delete --id="$ID" --no-confirm --api-key="$API_KEY"
+        done
+
+        echo "✅ Concluído."
+    keepgoing: false
+    strategy: node-first
+  uuid: delete-targets

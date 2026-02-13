@@ -1,0 +1,105 @@
+- defaultTab: nodes
+  description: |
+    Deleta snapshots com idade maior que N dias. Se N vazio, remove todos.
+
+    ---
+    Versão: __GIT_BRANCH__@__GIT_COMMIT__
+    Publicado em: __GIT_DATE__
+  executionEnabled: true
+  id: mgc-snapshot-cleanup-001
+  loglevel: INFO
+  name: "MGC - Snapshot Cleanup (Retention Days) "
+  nodeFilterEditable: false
+
+  options:
+    - name: API_KEY
+      label: MgcApiKey
+      description: "API Key para autenticar na Magalu Cloud"
+      required: true
+      secure: true
+      valueExposed: true
+
+    - name: RETENTION_DAYS
+      label: Retenção (dias)
+      description: |
+        Informe quantos dias deseja manter.
+        Se vazio, remove TODOS os snapshots.
+      required: false
+
+  sequence:
+    keepgoing: false
+    strategy: node-first
+    commands:
+      - script: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "====================================="
+          echo "Job version:"
+          echo "Branch : __GIT_BRANCH__"
+          echo "Commit : __GIT_COMMIT__"
+          echo "Publish: __GIT_DATE__"
+          echo "====================================="
+
+      - script: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          APIKEY="${RD_OPTION_API_KEY:?API Key é obrigatória.}"
+          RETENTION_DAYS="${RD_OPTION_RETENTION_DAYS:-}"
+
+          # Autentica
+          # mgc auth login --api-key "$MGC_API_KEY" >/dev/null
+
+          NOW_TS="$(date -u +%s)"
+
+          if [[ -n "$RETENTION_DAYS" ]]; then
+            if ! [[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+              echo "❌ RETENTION_DAYS precisa ser número inteiro (ex: 7). Valor recebido: '$RETENTION_DAYS'"
+              exit 1
+            fi
+            echo "📆 Retenção: ${RETENTION_DAYS} dias (deletar idade > ${RETENTION_DAYS})"
+          else
+            echo "⚠️ RETENTION_DAYS vazio: vou remover TODOS os snapshots listados."
+          fi
+          
+          echo "🔎 Listando snapshots..."
+          OUT="$(mgc virtual-machine snapshots list --api-key="$APIKEY" -o yaml --raw)"
+          
+          # Detecta automaticamente onde está a lista (snapshots ou results)
+          LIST_PATH='.snapshots'
+          echo "$OUT" | yq -e '.snapshots' >/dev/null 2>&1 || LIST_PATH='.results'
+          
+          echo "$OUT" \
+            | yq -r "${LIST_PATH}[] | @base64" \
+            | while read -r row; do
+                _jq() { echo "$row" | base64 -d | jq -r "$1"; }
+
+                SNAP_ID="$(_jq '.id')"
+                SNAP_NAME="$(_jq '.name')"
+                CREATED_AT="$(_jq '.created_at')"
+                INSTANCE_ID="$(_jq '.instance.id')"
+                STATUS="$(_jq '.status')"
+                STATE="$(_jq '.state')"
+
+                if [[ "$STATUS" != "completed" || "$STATE" != "available" ]]; then
+                  echo "⏭️ Pulando (status/state): $SNAP_NAME ($SNAP_ID) status=$STATUS state=$STATE"
+                  continue
+                fi
+
+                CREATED_TS="$(date -u -d "$CREATED_AT" +%s)"
+                AGE_DAYS="$(( (NOW_TS - CREATED_TS) / 86400 ))"
+
+                DELETE=false
+                if [[ -z "$RETENTION_DAYS" ]]; then
+                  DELETE=true
+                elif (( AGE_DAYS > RETENTION_DAYS )); then
+                  DELETE=true
+                fi
+
+                if [[ "$DELETE" == true ]]; then
+                  echo "🗑️ Deletando: $SNAP_NAME ($SNAP_ID) instance=$INSTANCE_ID created=$CREATED_AT age=${AGE_DAYS}d"
+                  mgc virtual-machine snapshots delete "$SNAP_ID" --api-key="$APIKEY" --no-confirm 
+                else
+                  echo "✅ Mantendo:  $SNAP_NAME ($SNAP_ID) age=${AGE_DAYS}d (<= ${RETENTION_DAYS}d)"
+                fi
+              done
+          echo "🏁 Finalizado."
